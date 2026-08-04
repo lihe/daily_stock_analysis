@@ -687,6 +687,13 @@ class Config:
     longbridge_oauth_client_id: Optional[str] = None
     stock_index_remote_update_enabled: bool = True
 
+    # === HHXG Data API（A 股市场/题材/软风险辅助）===
+    hhxg_data_api_token: Optional[str] = None
+    hhxg_data_api_base_url: str = "https://hhxg.top/api/data"
+    hhxg_data_api_timeout_seconds: float = 15.0
+    hhxg_data_api_cache_dir: str = "reports/evidence/hhxg_data"
+    hhxg_data_api_prompt_max_chars: int = 8000
+
     # === AlphaSift optional stock screening integration ===
     alphasift_enabled: bool = False
     alphasift_install_spec: str = DEFAULT_ALPHASIFT_INSTALL_SPEC
@@ -1556,6 +1563,26 @@ class Config:
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
             longbridge_access_token=os.getenv('LONGBRIDGE_ACCESS_TOKEN') or None,
             longbridge_oauth_client_id=os.getenv('LONGBRIDGE_OAUTH_CLIENT_ID') or None,
+            hhxg_data_api_token=os.getenv('HHXG_DATA_API_TOKEN') or None,
+            hhxg_data_api_base_url=(
+                os.getenv('HHXG_DATA_API_BASE_URL', 'https://hhxg.top/api/data').rstrip('/')
+            ),
+            hhxg_data_api_timeout_seconds=parse_env_float(
+                os.getenv('HHXG_DATA_API_TIMEOUT_SECONDS'),
+                15.0,
+                field_name='HHXG_DATA_API_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            hhxg_data_api_cache_dir=(
+                os.getenv('HHXG_DATA_API_CACHE_DIR', 'reports/evidence/hhxg_data').strip()
+                or 'reports/evidence/hhxg_data'
+            ),
+            hhxg_data_api_prompt_max_chars=parse_env_int(
+                os.getenv('HHXG_DATA_API_PROMPT_MAX_CHARS'),
+                8000,
+                field_name='HHXG_DATA_API_PROMPT_MAX_CHARS',
+                minimum=1000,
+            ),
             stock_index_remote_update_enabled=parse_env_bool(
                 os.getenv('STOCK_INDEX_REMOTE_UPDATE_ENABLED'),
                 default=True,

@@ -27,6 +27,7 @@ from src.config import Config, get_config
 from src.enums import ReportType
 from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
 from src.services.decision_signal_summary import format_decision_signal_excerpt
+from src.services.hhxg_data_service import render_hhxg_data_evidence
 from src.services.official_hard_event_service import render_official_hard_event_evidence
 from src.notification_routing import (
     get_notification_route_config,
@@ -358,6 +359,13 @@ class NotificationService(
     def _official_hard_event_excerpt(result: AnalysisResult, report_language: str) -> str:
         return render_official_hard_event_evidence(
             getattr(result, "official_hard_event_evidence", None),
+            report_language=report_language,
+        )
+
+    @staticmethod
+    def _hhxg_data_excerpt(result: AnalysisResult, report_language: str) -> str:
+        return render_hhxg_data_evidence(
+            getattr(result, "hhxg_data_evidence", None),
             report_language=report_language,
         )
 
@@ -1166,6 +1174,10 @@ class NotificationService(
                         report_lines.append(f"**📢 {labels['latest_news_label']}**: {intel['latest_news']}")
                     report_lines.append("")
 
+                hhxg_excerpt = self._hhxg_data_excerpt(result, report_language)
+                if hhxg_excerpt:
+                    report_lines.extend([hhxg_excerpt, ""])
+
                 official_event_excerpt = self._official_hard_event_excerpt(result, report_language)
                 if official_event_excerpt:
                     report_lines.extend([official_event_excerpt, ""])
@@ -1757,6 +1769,10 @@ class NotificationService(
         
         if info_added:
             lines.append("")
+
+        hhxg_excerpt = self._hhxg_data_excerpt(result, report_language)
+        if hhxg_excerpt:
+            lines.extend([hhxg_excerpt, ""])
 
         official_event_excerpt = self._official_hard_event_excerpt(result, report_language)
         if official_event_excerpt:

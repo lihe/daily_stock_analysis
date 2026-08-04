@@ -17,6 +17,7 @@ from src.analyzer import AnalysisResult
 from src.config import get_config
 from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
 from src.services.decision_signal_summary import format_decision_signal_excerpt
+from src.services.hhxg_data_service import render_hhxg_data_evidence
 from src.services.official_hard_event_service import render_official_hard_event_evidence
 from src.report_language import (
     get_localized_stock_name,
@@ -171,6 +172,12 @@ def render(
             report_language=report_language,
         )
 
+    def hhxg_data_excerpt(result: AnalysisResult) -> str:
+        return render_hhxg_data_evidence(
+            getattr(result, "hhxg_data_evidence", None),
+            report_language=report_language,
+        )
+
     def market_status_line() -> str:
         for source_results in (results or [], sorted_results):
             for result in source_results:
@@ -201,6 +208,7 @@ def render(
         "failed_checks": failed_checks,
         "phase_pack_excerpt": phase_pack_excerpt,
         "decision_signal_excerpt": decision_signal_excerpt,
+        "hhxg_data_excerpt": hhxg_data_excerpt,
         "official_hard_event_excerpt": official_hard_event_excerpt,
         "history_by_code": {},
         "get_chip_unavailable_reason": get_chip_unavailable_reason,

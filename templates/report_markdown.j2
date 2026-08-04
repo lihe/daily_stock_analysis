@@ -59,6 +59,12 @@
 
 {% endif %}
 
+{% set hhxg_section = hhxg_data_excerpt(result) %}
+{% if hhxg_section %}
+{{ hhxg_section }}
+
+{% endif %}
+
 {% set official_event_section = official_hard_event_excerpt(result) %}
 {% if official_event_section %}
 {{ official_event_section }}

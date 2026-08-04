@@ -63,6 +63,7 @@ from src.services.official_hard_event_service import (
     format_official_hard_event_prompt,
     sanitize_unverified_hard_event_context,
 )
+from src.services.hhxg_data_service import HHXGDataCache, HHXGDataService
 from src.schemas.hard_event import OfficialHardEventEvidence
 from src.services.analysis_context_builder import (
     AnalysisContextBuilder,
@@ -272,6 +273,31 @@ class StockAnalysisPipeline:
         except Exception as exc:
             logger.warning("正式交易所硬事件服务初始化失败: %s", exc, exc_info=True)
             self.official_hard_event_service = None
+
+        # HHXG 在每轮 run 开始时统一预取，逐股分析仅从这份内存缓存读取。
+        self.hhxg_data_cache: Optional[HHXGDataCache] = None
+        try:
+            self.hhxg_data_service = HHXGDataService(
+                token=getattr(self.config, "hhxg_data_api_token", None),
+                base_url=getattr(
+                    self.config,
+                    "hhxg_data_api_base_url",
+                    "https://hhxg.top/api/data",
+                ),
+                timeout_seconds=getattr(
+                    self.config,
+                    "hhxg_data_api_timeout_seconds",
+                    15.0,
+                ),
+                cache_dir=getattr(
+                    self.config,
+                    "hhxg_data_api_cache_dir",
+                    "reports/evidence/hhxg_data",
+                ),
+            )
+        except Exception as exc:
+            logger.warning("HHXG Data API 服务初始化失败: %s", exc, exc_info=True)
+            self.hhxg_data_service = None
 
         # 初始化社交舆情服务（仅美股，可选）
         try:
@@ -678,6 +704,7 @@ class StockAnalysisPipeline:
                 enhanced_context["official_hard_event_context"] = (
                     format_official_hard_event_prompt(official_hard_event_evidence)
                 )
+            self._attach_hhxg_data_context(enhanced_context, code=code, market=market)
             self._attach_daily_market_context(
                 enhanced_context,
                 daily_market_context,
@@ -814,6 +841,8 @@ class StockAnalysisPipeline:
                             code,
                             hard_event_adjustments,
                         )
+                if isinstance(enhanced_context.get("hhxg_data_evidence"), dict):
+                    result.hhxg_data_evidence = dict(enhanced_context["hhxg_data_evidence"])
                 if isinstance(fundamental_context, dict):
                     result.fundamental_context = fundamental_context
                 result.market_phase_summary = market_phase_summary
@@ -1225,6 +1254,11 @@ class StockAnalysisPipeline:
                 initial_context["official_hard_event_context"] = (
                     format_official_hard_event_prompt(official_hard_event_evidence)
                 )
+            self._attach_hhxg_data_context(
+                initial_context,
+                code=code,
+                market=get_market_for_stock(normalize_stock_code(code)),
+            )
             self._attach_daily_market_context(
                 initial_context,
                 daily_market_context,
@@ -1413,6 +1447,8 @@ class StockAnalysisPipeline:
                             code,
                             hard_event_adjustments,
                         )
+                if isinstance(initial_context.get("hhxg_data_evidence"), dict):
+                    result.hhxg_data_evidence = dict(initial_context["hhxg_data_evidence"])
                 if isinstance(fundamental_context, dict):
                     result.fundamental_context = fundamental_context
                 result.market_phase_summary = market_phase_summary
@@ -1701,6 +1737,62 @@ class StockAnalysisPipeline:
             return
         target_context["daily_market_context"] = safe_context
         target_context["daily_market_context_summary"] = prompt_section
+
+    def _prefetch_hhxg_data_cache(self, *, target_date: date) -> None:
+        """Fetch all HHXG scopes once before any per-stock worker starts."""
+        service = getattr(self, "hhxg_data_service", None)
+        if service is None:
+            logger.warning("HHXG Data API 服务不可用，本轮跳过共享缓存")
+            return
+        try:
+            cache = service.prefetch(target_date=target_date)
+            self.hhxg_data_cache = cache
+            counts = cache.status_counts
+            if not cache.enabled:
+                logger.info("HHXG Data API 共享缓存未启用: %s", cache.reason)
+                return
+            logger.info(
+                "HHXG Data API 统一预取完成: cache_id=%s scopes=%s "
+                "ok=%s stale=%s unknown_date=%s unavailable=%s",
+                cache.cache_id,
+                len(cache.scopes),
+                counts.get("ok", 0),
+                counts.get("stale", 0),
+                counts.get("unknown_date", 0),
+                counts.get("unavailable", 0),
+            )
+        except Exception as exc:
+            logger.warning("HHXG Data API 统一预取失败，个股分析继续: %s", exc, exc_info=True)
+            self.hhxg_data_cache = None
+
+    def _attach_hhxg_data_context(
+        self,
+        target_context: Dict[str, Any],
+        *,
+        code: str,
+        market: str,
+    ) -> None:
+        """Attach a stock projection without copying the raw run-level cache."""
+        if str(market or "").lower() != "cn":
+            return
+        service = getattr(self, "hhxg_data_service", None)
+        cache = getattr(self, "hhxg_data_cache", None)
+        if service is None or cache is None or not cache.enabled:
+            return
+        try:
+            evidence = service.build_stock_evidence(cache, code)
+            prompt = service.format_stock_prompt(
+                cache,
+                code,
+                max_chars=getattr(self.config, "hhxg_data_api_prompt_max_chars", 8000),
+            )
+            # 通用市场/新闻数据只能作为软线索，硬事件仍由交易所证据独占。
+            prompt = sanitize_unverified_hard_event_context(prompt)
+            target_context["hhxg_data_evidence"] = evidence
+            if prompt:
+                target_context["hhxg_data_context"] = prompt
+        except Exception as exc:
+            logger.warning("%s HHXG 缓存投影失败，个股分析继续: %s", code, exc)
 
     def _agent_result_to_analysis_result(
         self,
@@ -2657,11 +2749,13 @@ class StockAnalysisPipeline:
         sanitized.pop("analysis_context_pack_summary", None)
         sanitized.pop("daily_market_context_summary", None)
         sanitized.pop("official_hard_event_context", None)
+        sanitized.pop("hhxg_data_context", None)
         enhanced_context = sanitized.get("enhanced_context")
         if isinstance(enhanced_context, dict):
             enhanced_context = dict(enhanced_context)
             enhanced_context.pop("daily_market_context_summary", None)
             enhanced_context.pop("official_hard_event_context", None)
+            enhanced_context.pop("hhxg_data_context", None)
             sanitized["enhanced_context"] = enhanced_context
         return sanitized
 
@@ -2945,6 +3039,18 @@ class StockAnalysisPipeline:
 
         # 冻结本轮运行的统一参考时间，避免跨市场收盘边界时同批股票使用不同目标交易日。
         resume_reference_time = current_time or datetime.now(timezone.utc)
+
+        # HHXG 只服务 A 股。所有 scope 在逐股线程启动前统一请求一次，随后只读共享缓存。
+        has_cn_stock = any(
+            get_market_for_stock(normalize_stock_code(code)) == "cn"
+            for code in stock_codes
+        )
+        if has_cn_stock and not dry_run:
+            hhxg_target_date = get_effective_trading_date(
+                "cn",
+                current_time=resume_reference_time,
+            )
+            self._prefetch_hhxg_data_cache(target_date=hhxg_target_date)
         
         # === 批量预取实时行情（优化：避免每只股票都触发全量拉取）===
         # 只有股票数量 >= 5 时才进行预取，少量股票直接逐个查询更高效

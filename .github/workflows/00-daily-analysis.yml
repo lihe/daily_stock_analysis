@@ -247,6 +247,12 @@ jobs:
           # 数据源
           # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          # HHXG Data API 与 MCP token 独立；每轮股票分析统一拉取 23 个 scope 后共享缓存。
+          HHXG_DATA_API_TOKEN: ${{ secrets.HHXG_DATA_API_TOKEN }}
+          HHXG_DATA_API_BASE_URL: ${{ vars.HHXG_DATA_API_BASE_URL || 'https://hhxg.top/api/data' }}
+          HHXG_DATA_API_TIMEOUT_SECONDS: ${{ vars.HHXG_DATA_API_TIMEOUT_SECONDS || '15' }}
+          HHXG_DATA_API_CACHE_DIR: reports/evidence/hhxg_data
+          HHXG_DATA_API_PROMPT_MAX_CHARS: ${{ vars.HHXG_DATA_API_PROMPT_MAX_CHARS || '8000' }}
           # Longbridge OpenAPI（美股/港股实时行情字段补充；不设则仅 YFinance/AkShare，无 [Longbridge] 调用）
           LONGBRIDGE_OAUTH_CLIENT_ID: ${{ vars.LONGBRIDGE_OAUTH_CLIENT_ID || secrets.LONGBRIDGE_OAUTH_CLIENT_ID }}
           LONGBRIDGE_OAUTH_TOKEN_CACHE_B64: ${{ secrets.LONGBRIDGE_OAUTH_TOKEN_CACHE_B64 }}
@@ -440,6 +446,7 @@ jobs:
           echo ""
           echo "【数据源】"
           echo "  Tushare Token: $([ -n "$TUSHARE_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  HHXG Data API: $([ -n "$HHXG_DATA_API_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           if [ -n "$LONGBRIDGE_APP_KEY" ] && [ -n "$LONGBRIDGE_APP_SECRET" ] && [ -n "$LONGBRIDGE_ACCESS_TOKEN" ]; then
             echo "  Longbridge: ✅ 已配置（Legacy API Key）"
           elif [ -n "$LONGBRIDGE_OAUTH_CLIENT_ID" ] || { [ -n "$LONGBRIDGE_APP_KEY" ] && [ -z "$LONGBRIDGE_ACCESS_TOKEN" ]; }; then
@@ -501,6 +508,13 @@ jobs:
         run: |
           python scripts/summarize_official_evidence.py \
             --evidence-dir reports/evidence \
+            --github-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: 汇总 HHXG 共享缓存状态
+        if: always()
+        run: |
+          python scripts/summarize_hhxg_cache.py \
+            --manifest reports/evidence/hhxg_data/manifest.json \
             --github-summary "$GITHUB_STEP_SUMMARY"
       
       - name: 上传分析报告

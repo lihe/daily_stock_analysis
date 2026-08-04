@@ -380,6 +380,11 @@ daily_stock_analysis/
 | 变量名 | 说明 | 默认值 | 必填 |
 |--------|------|--------|:----:|
 | `TUSHARE_TOKEN` | Tushare Pro Token | - | 可选 |
+| `HHXG_DATA_API_TOKEN` | HHXG Data API Token；与 MCP Token 独立，仅用于 A 股辅助上下文 | - | 可选 |
+| `HHXG_DATA_API_BASE_URL` | HHXG Data API 根地址 | `https://hhxg.top/api/data` | 可选 |
+| `HHXG_DATA_API_TIMEOUT_SECONDS` | 单个 HHXG scope 请求超时秒数 | `15` | 可选 |
+| `HHXG_DATA_API_CACHE_DIR` | 本轮 23 个 scope 原始响应与 manifest 的保存目录 | `reports/evidence/hhxg_data` | 可选 |
+| `HHXG_DATA_API_PROMPT_MAX_CHARS` | 注入每只股票分析的 HHXG 压缩上下文字符上限 | `8000` | 可选 |
 | `TICKFLOW_API_KEY` | TickFlow API Key；配置后 A 股大盘复盘指数优先尝试 TickFlow，若套餐支持标的池查询则市场统计也会优先尝试 TickFlow | - | 可选 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | Longbridge OAuth client_id；留空且无 Legacy Access Token 时会兼容使用 `LONGBRIDGE_APP_KEY` | - | 可选 |
 | `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | OAuth token 缓存文件的 base64 内容，供 GitHub Actions / Docker 等 headless 环境使用 | - | 可选 |
@@ -400,6 +405,8 @@ daily_stock_analysis/
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（TTL 内按时间淘汰） | `256` | 可选 |
 
 > 行为说明：
+> - 配置 `HHXG_DATA_API_TOKEN` 后，股票分析会在逐股线程启动前统一请求 23 个 scope；同一轮所有 A 股共享一份只读缓存，不按股票重复调用。原始 JSON 和 `manifest.json` 会进入 `reports/evidence/hhxg_data` 并随 Action Artifact 保存。
+> - HHXG 的 `stale`、`unknown_date`、`unavailable` 状态会作为数据缺口展示；空数据记为 `no_data`，不能解释为无风险。该数据只辅助市场、题材、技术和软风险判断，不替代正式交易所硬事件，也不提供分钟分时、VWAP 或五档盘口。
 > - A 股：按 `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards` 聚合能力返回；
 > - ETF：返回可得项，缺失能力标记为 `not_supported`，整体不影响原流程；
 > - 美股/港股：通过 yfinance 适配器返回 `valuation/growth/earnings/belong_boards`（来源 `info.sector`/`industry`），`institution/capital_flow/dragon_tiger/boards` 暂无对应数据源仍标记 `not_supported`；yfinance 不可用或字段缺失时整体降级回 `not_supported`，仍走 fail-open；

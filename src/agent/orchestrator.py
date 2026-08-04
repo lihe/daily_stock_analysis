@@ -727,6 +727,8 @@ class AgentOrchestrator:
                 "daily_history",
                 "chip_distribution",
                 "trend_result",
+                "hhxg_data_context",
+                "hhxg_data_evidence",
                 "official_hard_event_context",
                 "official_hard_event_evidence",
                 "news_context",

@@ -1632,6 +1632,9 @@ class AnalysisResult:
     # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
     fundamental_context: Optional[Dict[str, Any]] = None
 
+    # ========== HHXG 共享缓存证据（运行时与报告展示）==========
+    hhxg_data_evidence: Optional[Dict[str, Any]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -1665,6 +1668,7 @@ class AnalysisResult:
             'buy_reason': self.buy_reason,
             'market_snapshot': self.market_snapshot,
             'official_hard_event_evidence': self.official_hard_event_evidence,
+            'hhxg_data_evidence': self.hhxg_data_evidence,
             'search_performed': self.search_performed,
             'success': self.success,
             'error_message': self.error_message,
@@ -3609,6 +3613,14 @@ class GeminiAnalyzer:
             if math.isfinite(parsed_volume_change) and parsed_volume_change > 10:
                 prompt += """
 - ⚠️ 量能异常提示：成交量较昨日放大超过10倍，可能受异常数据或一次性冲量影响，必须降权解读，不能机械视为强确认信号
+"""
+
+        hhxg_data_context = context.get("hhxg_data_context")
+        if isinstance(hhxg_data_context, str) and hhxg_data_context.strip():
+            prompt += f"""
+---
+
+{hhxg_data_context.strip()}
 """
         
         # 正式交易所硬事件与通用新闻必须分层，避免搜索摘要被当成公告事实。
