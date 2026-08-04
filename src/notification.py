@@ -27,6 +27,7 @@ from src.config import Config, get_config
 from src.enums import ReportType
 from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
 from src.services.decision_signal_summary import format_decision_signal_excerpt
+from src.services.official_hard_event_service import render_official_hard_event_evidence
 from src.notification_routing import (
     get_notification_route_config,
     split_notification_route_channels,
@@ -350,6 +351,13 @@ class NotificationService(
     def _decision_signal_excerpt(self, result: AnalysisResult, report_language: str) -> str:
         return format_decision_signal_excerpt(
             getattr(result, "decision_signal_summary", None),
+            report_language=report_language,
+        )
+
+    @staticmethod
+    def _official_hard_event_excerpt(result: AnalysisResult, report_language: str) -> str:
+        return render_official_hard_event_evidence(
+            getattr(result, "official_hard_event_evidence", None),
             report_language=report_language,
         )
 
@@ -1157,6 +1165,10 @@ class NotificationService(
                         report_lines.append("")
                         report_lines.append(f"**📢 {labels['latest_news_label']}**: {intel['latest_news']}")
                     report_lines.append("")
+
+                official_event_excerpt = self._official_hard_event_excerpt(result, report_language)
+                if official_event_excerpt:
+                    report_lines.extend([official_event_excerpt, ""])
                 
                 # ========== 核心结论 ==========
                 core = dashboard.get('core_conclusion', {}) if dashboard else {}
@@ -1745,6 +1757,10 @@ class NotificationService(
         
         if info_added:
             lines.append("")
+
+        official_event_excerpt = self._official_hard_event_excerpt(result, report_language)
+        if official_event_excerpt:
+            lines.extend([official_event_excerpt, ""])
         
         # 狙击点位
         sniper = battle.get('sniper_points', {}) if battle else {}

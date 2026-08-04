@@ -1612,6 +1612,7 @@ class AnalysisResult:
 
     # ========== 元数据 ==========
     market_snapshot: Optional[Dict[str, Any]] = None  # 当日行情快照（展示用）
+    official_hard_event_evidence: Optional[Dict[str, Any]] = None  # 正式交易所硬事件证据
     raw_response: Optional[str] = None  # 原始响应（调试用）
     search_performed: bool = False  # 是否执行了联网搜索
     data_sources: str = ""  # 数据来源说明
@@ -1663,6 +1664,7 @@ class AnalysisResult:
             'risk_warning': self.risk_warning,
             'buy_reason': self.buy_reason,
             'market_snapshot': self.market_snapshot,
+            'official_hard_event_evidence': self.official_hard_event_evidence,
             'search_performed': self.search_performed,
             'success': self.success,
             'error_message': self.error_message,
@@ -3609,6 +3611,18 @@ class GeminiAnalyzer:
 - ⚠️ 量能异常提示：成交量较昨日放大超过10倍，可能受异常数据或一次性冲量影响，必须降权解读，不能机械视为强确认信号
 """
         
+        # 正式交易所硬事件与通用新闻必须分层，避免搜索摘要被当成公告事实。
+        official_hard_event_context = context.get("official_hard_event_context")
+        if isinstance(official_hard_event_context, str) and official_hard_event_context.strip():
+            prompt += f"""
+---
+
+{official_hard_event_context.strip()}
+
+> 强制约束：凡涉及停牌、复牌、监管、纪律处分、业绩报告/预告、减持，
+> 只能引用本节的事件标题、发布日期、报告期和链接；不得从通用新闻补充或改写硬事实。
+"""
+
         # 添加新闻搜索结果（重点区域）
         news_window_days: Optional[int] = None
         context_window = context.get("news_window_days")
@@ -3633,14 +3647,15 @@ class GeminiAnalyzer:
 """
         if news_context:
             prompt += f"""
-以下是 **{stock_name}({code})** 近{news_window_days}日的新闻搜索结果，请重点提取：
-1. 🚨 **风险警报**：减持、处罚、利空
-2. 🎯 **利好催化**：业绩、合同、政策
-3. 📊 **业绩预期**：年报预告、业绩快报
+以下是 **{stock_name}({code})** 近{news_window_days}日的新闻搜索结果（通用软信息），请重点提取：
+1. 🚨 **软风险线索**：行业风险、经营舆情、市场传闻，并明确其非交易所硬事实
+2. 🎯 **软催化线索**：行业景气、合同、政策和市场关注
+3. 📊 **经营预期**：只能作观点归纳，不得据此认定正式业绩公告或报告期
 4. 🕒 **时间规则（强制）**：
    - 输出到 `risk_alerts` / `positive_catalysts` / `latest_news` 的每一条都必须带具体日期（YYYY-MM-DD）
    - 超出近{news_window_days}日窗口的新闻一律忽略
    - 时间未知、无法确定发布日期的新闻一律忽略
+   - 新闻中出现停牌、监管、业绩报告/预告、减持时，只能视为待核线索；若正式交易所硬事件章节未确认，禁止写入结论
 
 ```
 {news_context}

@@ -722,8 +722,15 @@ class AgentOrchestrator:
                 ctx.meta["analysis_context_pack_summary"] = analysis_context_pack_summary
 
             # Pre-populate data fields that the caller already has
-            for data_key in ("realtime_quote", "daily_history", "chip_distribution",
-                             "trend_result", "news_context"):
+            for data_key in (
+                "realtime_quote",
+                "daily_history",
+                "chip_distribution",
+                "trend_result",
+                "official_hard_event_context",
+                "official_hard_event_evidence",
+                "news_context",
+            ):
                 if context.get(data_key):
                     ctx.set_data(data_key, context[data_key])
 

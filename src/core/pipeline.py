@@ -57,6 +57,12 @@ from src.services.daily_market_context import (
 )
 from src.services.social_sentiment_service import SocialSentimentService
 from src.services.intelligence_service import IntelligenceService
+from src.services.official_hard_event_service import (
+    OfficialHardEventService,
+    apply_official_hard_event_guardrail,
+    format_official_hard_event_prompt,
+)
+from src.schemas.hard_event import OfficialHardEventEvidence
 from src.services.analysis_context_builder import (
     AnalysisContextBuilder,
     PipelineAnalysisArtifacts,
@@ -259,6 +265,13 @@ class StockAnalysisPipeline:
         else:
             logger.warning("搜索服务未启用（未配置搜索能力）")
 
+        # A 股硬事件必须来自交易所元数据；服务失败时由逐股证据标记为 BLOCKED。
+        try:
+            self.official_hard_event_service = OfficialHardEventService()
+        except Exception as exc:
+            logger.warning("正式交易所硬事件服务初始化失败: %s", exc, exc_info=True)
+            self.official_hard_event_service = None
+
         # 初始化社交舆情服务（仅美股，可选）
         try:
             self.social_sentiment_service = SocialSentimentService(
@@ -439,6 +452,14 @@ class StockAnalysisPipeline:
             if not stock_name:
                 stock_name = f'股票{code}'
 
+            # Step 1.5: 正式交易所硬事件核验。通用新闻只保留为线索，不能替代本证据。
+            official_hard_event_evidence = self._collect_official_hard_event_evidence(
+                code=code,
+                stock_name=stock_name,
+                query_id=query_id,
+                current_time=current_time,
+            )
+
             # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
             chip_data = None
             try:
@@ -540,6 +561,7 @@ class StockAnalysisPipeline:
                     market_phase_summary=market_phase_summary,
                     daily_market_context=daily_market_context,
                     portfolio_context=portfolio_context,
+                    official_hard_event_evidence=official_hard_event_evidence,
                 )
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
@@ -639,6 +661,13 @@ class StockAnalysisPipeline:
                 portfolio_context=portfolio_context,
             )
             enhanced_context["market_phase_context"] = market_phase_context_dict
+            if official_hard_event_evidence is not None:
+                enhanced_context["official_hard_event_evidence"] = (
+                    official_hard_event_evidence.to_dict()
+                )
+                enhanced_context["official_hard_event_context"] = (
+                    format_official_hard_event_prompt(official_hard_event_evidence)
+                )
             self._attach_daily_market_context(
                 enhanced_context,
                 daily_market_context,
@@ -764,6 +793,17 @@ class StockAnalysisPipeline:
                         code,
                         market_context_adjustments,
                     )
+                if official_hard_event_evidence is not None:
+                    hard_event_adjustments = apply_official_hard_event_guardrail(
+                        result,
+                        official_hard_event_evidence,
+                    )
+                    if hard_event_adjustments:
+                        logger.info(
+                            "[official_hard_event_guardrail] Applied adjustments for %s: %s",
+                            code,
+                            hard_event_adjustments,
+                        )
                 if isinstance(fundamental_context, dict):
                     result.fundamental_context = fundamental_context
                 result.market_phase_summary = market_phase_summary
@@ -1137,6 +1177,7 @@ class StockAnalysisPipeline:
         market_phase_summary: Optional[Dict[str, Any]] = None,
         daily_market_context: Optional[DailyMarketContext] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        official_hard_event_evidence: Optional[OfficialHardEventEvidence] = None,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -1167,6 +1208,13 @@ class StockAnalysisPipeline:
                 initial_context["skills"] = self.analysis_skills
             if market_phase_context is not None:
                 initial_context["market_phase_context"] = market_phase_context
+            if official_hard_event_evidence is not None:
+                initial_context["official_hard_event_evidence"] = (
+                    official_hard_event_evidence.to_dict()
+                )
+                initial_context["official_hard_event_context"] = (
+                    format_official_hard_event_prompt(official_hard_event_evidence)
+                )
             self._attach_daily_market_context(
                 initial_context,
                 daily_market_context,
@@ -1335,6 +1383,17 @@ class StockAnalysisPipeline:
                         code,
                         market_context_adjustments,
                     )
+                if official_hard_event_evidence is not None:
+                    hard_event_adjustments = apply_official_hard_event_guardrail(
+                        result,
+                        official_hard_event_evidence,
+                    )
+                    if hard_event_adjustments:
+                        logger.info(
+                            "[official_hard_event_guardrail] Applied agent adjustments for %s: %s",
+                            code,
+                            hard_event_adjustments,
+                        )
                 if isinstance(fundamental_context, dict):
                     result.fundamental_context = fundamental_context
                 result.market_phase_summary = market_phase_summary
@@ -2578,14 +2637,77 @@ class StockAnalysisPipeline:
         sanitized.pop("analysis_context_pack", None)
         sanitized.pop("analysis_context_pack_summary", None)
         sanitized.pop("daily_market_context_summary", None)
+        sanitized.pop("official_hard_event_context", None)
         enhanced_context = sanitized.get("enhanced_context")
         if isinstance(enhanced_context, dict):
             enhanced_context = dict(enhanced_context)
             enhanced_context.pop("daily_market_context_summary", None)
+            enhanced_context.pop("official_hard_event_context", None)
             sanitized["enhanced_context"] = enhanced_context
         return sanitized
 
     _without_market_phase_context = _without_runtime_prompt_context
+
+    def _collect_official_hard_event_evidence(
+        self,
+        *,
+        code: str,
+        stock_name: str,
+        query_id: str,
+        current_time: Optional[datetime],
+    ) -> Optional[OfficialHardEventEvidence]:
+        """Collect official evidence without breaking legacy test doubles."""
+        if not hasattr(self, "official_hard_event_service"):
+            return None
+
+        service = getattr(self, "official_hard_event_service", None)
+        end_date = None
+        if current_time is not None:
+            if current_time.tzinfo is not None:
+                end_date = current_time.astimezone(timezone(timedelta(hours=8))).date()
+            else:
+                end_date = current_time.date()
+
+        if service is None:
+            service = OfficialHardEventService()
+            return service.unavailable_evidence(
+                code,
+                stock_name,
+                end_date=end_date,
+                error="OfficialHardEventService initialization failed",
+                query_id=query_id,
+            )
+
+        try:
+            evidence = service.collect(
+                code,
+                stock_name,
+                end_date=end_date,
+                query_id=query_id,
+            )
+            logger.info(
+                "%s(%s) 正式交易所硬事件核验: status=%s events=%s",
+                stock_name,
+                code,
+                evidence.status,
+                len(evidence.events),
+            )
+            return evidence
+        except Exception as exc:
+            logger.warning(
+                "%s(%s) 正式交易所硬事件核验异常，降级为 BLOCKED: %s",
+                stock_name,
+                code,
+                exc,
+                exc_info=True,
+            )
+            return service.unavailable_evidence(
+                code,
+                stock_name,
+                end_date=end_date,
+                error=f"{type(exc).__name__}: {exc}",
+                query_id=query_id,
+            )
 
     @staticmethod
     def _resolve_resume_target_date(

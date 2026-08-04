@@ -59,6 +59,12 @@
 
 {% endif %}
 
+{% set official_event_section = official_hard_event_excerpt(result) %}
+{% if official_event_section %}
+{{ official_event_section }}
+
+{% endif %}
+
 ### 📌 {{ labels.core_conclusion_heading }}
 
 **{{ e.signal_emoji }} {{ e.signal_text }}** | {{ localize_trend_prediction(result.trend_prediction, report_language) }}

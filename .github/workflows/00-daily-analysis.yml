@@ -495,6 +495,13 @@ jobs:
           else
             python main.py $FORCE_RUN_ARG
           fi
+
+      - name: 汇总正式交易所核验状态
+        if: always()
+        run: |
+          python scripts/summarize_official_evidence.py \
+            --evidence-dir reports/evidence \
+            --github-summary "$GITHUB_STEP_SUMMARY"
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6

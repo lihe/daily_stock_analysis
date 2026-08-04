@@ -33,6 +33,21 @@ def _builtin_strategy_names() -> set[str]:
     return {path.stem for path in strategies_dir.glob("*.yaml")}
 
 
+def _stub_official_hard_events(pipeline) -> None:
+    from src.schemas.hard_event import OfficialHardEventEvidence
+
+    service = MagicMock()
+    service.collect.return_value = OfficialHardEventEvidence(
+        stock_code="600519",
+        stock_name="贵州茅台",
+        query_start="2026-02-01",
+        query_end="2026-08-04",
+        checked_at="2026-08-04T14:00:00+08:00",
+        status="CLEAN",
+    )
+    pipeline.official_hard_event_service = service
+
+
 # ============================================================
 # Config tests
 # ============================================================
@@ -1527,6 +1542,7 @@ class TestPipelineRouting(unittest.TestCase):
             from src.core.pipeline import StockAnalysisPipeline
             from src.enums import ReportType
             pipeline = StockAnalysisPipeline(config=mock_cfg)
+            _stub_official_hard_events(pipeline)
 
             # Mock _analyze_with_agent to verify it gets called
             pipeline._analyze_with_agent = MagicMock(return_value=None)
@@ -1573,6 +1589,7 @@ class TestPipelineRouting(unittest.TestCase):
             from src.core.pipeline import StockAnalysisPipeline
             from src.enums import ReportType
             pipeline = StockAnalysisPipeline(config=mock_cfg)
+            _stub_official_hard_events(pipeline)
 
             # Mock the fetcher_manager to return None for realtime
             pipeline.fetcher_manager.get_realtime_quote.return_value = None
@@ -1623,6 +1640,7 @@ class TestPipelineRouting(unittest.TestCase):
                 config=mock_cfg,
                 analysis_skills=["growth_quality"],
             )
+            _stub_official_hard_events(pipeline)
             pipeline._analyze_with_agent = MagicMock(return_value=None)
 
             pipeline.analyze_stock("600519", ReportType.SIMPLE, "q1")
