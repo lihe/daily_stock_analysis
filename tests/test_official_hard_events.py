@@ -9,6 +9,7 @@ from src.services.official_hard_event_service import (
     apply_official_hard_event_guardrail,
     format_official_hard_event_prompt,
     render_official_hard_event_evidence,
+    sanitize_unverified_hard_event_context,
 )
 
 
@@ -92,7 +93,8 @@ def _analysis_result() -> SimpleNamespace:
             "intelligence": {
                 "risk_alerts": ["2026-08-04 公司停牌", "行业需求走弱"],
                 "earnings_outlook": "2025年半年报显示当前业绩增长",
-                "positive_catalysts": [],
+                "positive_catalysts": ["公司预告上半年归母净利润同比增长"],
+                "latest_news": "公司公告目前无监管处罚或业绩变脸硬事实",
             },
         },
     )
@@ -143,7 +145,9 @@ def test_partial_official_coverage_fails_closed_and_removes_llm_hard_facts(tmp_p
     assert "停牌" not in result.analysis_summary
     assert "半年报" not in result.news_summary
     assert "监管函" not in result.risk_warning
-    assert result.dashboard["intelligence"]["risk_alerts"][1] == "行业需求走弱"
+    assert result.dashboard["intelligence"]["risk_alerts"] == ["行业需求走弱"]
+    assert result.dashboard["intelligence"]["positive_catalysts"] == []
+    assert "监管处罚" not in result.dashboard["intelligence"]["latest_news"]
     assert result.official_hard_event_evidence["status"] == "PARTIAL"
 
 
@@ -255,3 +259,18 @@ def test_annual_report_period_is_rendered_without_duplicate_year_marker(tmp_path
     )
 
     assert evidence.events[0].report_period == "2025年度"
+
+
+def test_unverified_news_hard_events_are_removed_before_llm():
+    news = (
+        "2026-08-04 行业需求改善。\n"
+        "2026-07-22 公司预告上半年归母净利润同比增长。\n"
+        "2026-08-03 券商观点认为估值合理。"
+    )
+
+    sanitized = sanitize_unverified_hard_event_context(news)
+
+    assert "行业需求改善" in sanitized
+    assert "券商观点认为估值合理" in sanitized
+    assert "预告" not in sanitized
+    assert "净利润" not in sanitized

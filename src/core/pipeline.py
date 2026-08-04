@@ -61,6 +61,7 @@ from src.services.official_hard_event_service import (
     OfficialHardEventService,
     apply_official_hard_event_guardrail,
     format_official_hard_event_prompt,
+    sanitize_unverified_hard_event_context,
 )
 from src.schemas.hard_event import OfficialHardEventEvidence
 from src.services.analysis_context_builder import (
@@ -630,6 +631,15 @@ class StockAnalysisPipeline:
                     if news_context
                     else persisted_intelligence_context
                 )
+
+            if (
+                official_hard_event_evidence is not None
+                and official_hard_event_evidence.status != "NOT_APPLICABLE"
+            ):
+                sanitized_news_context = sanitize_unverified_hard_event_context(news_context)
+                if sanitized_news_context != news_context:
+                    logger.info("%s(%s) 已从通用新闻上下文移除未经核验的硬事件线索", stock_name, code)
+                news_context = sanitized_news_context
 
             # Step 5: 获取分析上下文（技术面数据）
             self._emit_progress(58, f"{stock_name}：正在整理分析上下文")
@@ -1257,6 +1267,15 @@ class StockAnalysisPipeline:
                     else persisted_intelligence_context
                 )
                 logger.info(f"[{code}] Agent mode: local intelligence evidence injected into news_context")
+
+            if (
+                official_hard_event_evidence is not None
+                and official_hard_event_evidence.status != "NOT_APPLICABLE"
+                and initial_context.get("news_context")
+            ):
+                initial_context["news_context"] = sanitize_unverified_hard_event_context(
+                    initial_context["news_context"]
+                )
 
             # Issue #1066: ensure deep history is in DB before agent tools run
             self._ensure_agent_history(code)

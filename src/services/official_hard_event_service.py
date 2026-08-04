@@ -28,6 +28,19 @@ _CST = timezone(timedelta(hours=8))
 _HARD_EVENT_TERMS = (
     "停牌",
     "复牌",
+    "停复牌",
+    "监管",
+    "处罚",
+    "问询",
+    "立案",
+    "公告",
+    "预告",
+    "年报",
+    "中报",
+    "季报",
+    "业绩变脸",
+    "净利润",
+    "营业收入",
     "监管函",
     "监管警示",
     "监管措施",
@@ -453,6 +466,15 @@ def apply_official_hard_event_guardrail(
     return adjustments
 
 
+def sanitize_unverified_hard_event_context(value: Any) -> Any:
+    """Remove hard-event claims from non-official text before LLM ingestion."""
+    if not isinstance(value, str) or not value.strip():
+        return value
+    parts = _SENTENCE_SPLIT.split(value)
+    kept = [part for part in parts if part and not _contains_hard_event_term(part)]
+    return "".join(kept).strip()
+
+
 def _classify_records(records: Iterable[Dict[str, Any]], code: str) -> List[OfficialHardEvent]:
     events: List[OfficialHardEvent] = []
     seen: set[Tuple[str, str, str, str]] = set()
@@ -553,10 +575,10 @@ def _extract_report_period(title: str) -> Optional[str]:
 
 def _sanitize_generated_value(value: Any, replacement: str) -> Tuple[Any, bool]:
     if isinstance(value, str):
-        if not any(term in value for term in _HARD_EVENT_TERMS):
+        if not _contains_hard_event_term(value):
             return value, False
         parts = _SENTENCE_SPLIT.split(value)
-        kept = [part for part in parts if part and not any(term in part for term in _HARD_EVENT_TERMS)]
+        kept = [part for part in parts if part and not _contains_hard_event_term(part)]
         sanitized = "".join(kept).strip()
         if sanitized:
             sanitized = f"{sanitized} {replacement}"
@@ -569,6 +591,8 @@ def _sanitize_generated_value(value: Any, replacement: str) -> Tuple[Any, bool]:
         for item in value:
             sanitized, item_changed = _sanitize_generated_value(item, replacement)
             changed = changed or item_changed
+            if item_changed and sanitized == replacement:
+                continue
             if sanitized not in (None, "", [], {}):
                 sanitized_list.append(sanitized)
         return sanitized_list, changed
@@ -581,3 +605,7 @@ def _sanitize_generated_value(value: Any, replacement: str) -> Tuple[Any, bool]:
             changed = changed or item_changed
         return sanitized_dict, changed
     return value, False
+
+
+def _contains_hard_event_term(value: str) -> bool:
+    return any(term in value for term in _HARD_EVENT_TERMS)
