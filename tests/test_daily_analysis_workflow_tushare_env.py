@@ -23,3 +23,6 @@ def test_daily_analysis_maps_tushare_compatible_endpoint_settings() -> None:
     assert env["TUSHARE_TOKEN"] == "${{ secrets.TUSHARE_TOKEN }}"
     assert env["TUSHARE_API_URL"] == "${{ vars.TUSHARE_API_URL || 'http://api.tushare.pro' }}"
     assert env["TUSHARE_BYPASS_PROXY"] == "${{ vars.TUSHARE_BYPASS_PROXY || 'false' }}"
+    assert env["REALTIME_SOURCE_PRIORITY"] == (
+        "${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}"
+    )

@@ -84,6 +84,81 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_realtime_priority_ignores_tushare_token_without_explicit_override(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "TUSHARE_TOKEN": "demo-token",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(
+            config.realtime_source_priority,
+            "tencent,akshare_sina,efinance,akshare_em",
+        )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_realtime_priority_keeps_explicit_custom_value(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "TUSHARE_TOKEN": "demo-token",
+                "REALTIME_SOURCE_PRIORITY": "tushare,tencent",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.realtime_source_priority, "tushare,tencent")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_realtime_priority_uses_default_for_empty_explicit_value(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "REALTIME_SOURCE_PRIORITY": "",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(
+            config.realtime_source_priority,
+            "tencent,akshare_sina,efinance,akshare_em",
+        )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_realtime_priority_keeps_whitespace_only_explicit_value(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "REALTIME_SOURCE_PRIORITY": "   ",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.realtime_source_priority, "   ")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_generation_backend_env_defaults_to_litellm_contract(
         self, _mock_parse_litellm_yaml, _mock_setup_env
     ):
