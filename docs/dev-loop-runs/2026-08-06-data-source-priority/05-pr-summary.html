@@ -21,6 +21,13 @@
         --danger: #a05050;
         --code-bg: #ececea;
 
+        /* Text-only accessibility tokens. The original accent/warn
+           values above remain the decorative palette. */
+        --text-muted: #595959;
+        --accent-text: #375f78;
+        --warn-text: #6d4b18;
+        --session-text: #4a5142;
+
         /* Semantic palette for three-layer cards. Rename freely
            (e.g. --layer-a / --layer-b / --layer-c) when the three
            layers in the doc are not brain/hands/session. */
@@ -64,7 +71,7 @@
         font-size: 11px;
         letter-spacing: 0.12em;
         text-transform: uppercase;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         margin-bottom: 14px;
       }
       .doc-title {
@@ -87,7 +94,7 @@
           ui-monospace, Menlo,
           "PingFang SC", "Hiragino Sans GB", monospace;
         font-size: 11px;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         margin-top: 18px;
         display: flex;
         gap: 24px;
@@ -108,7 +115,7 @@
         font-size: 11px;
         letter-spacing: 0.12em;
         text-transform: uppercase;
-        color: var(--accent);
+        color: var(--accent-text);
         margin-bottom: 8px;
         font-weight: 600;
       }
@@ -128,7 +135,7 @@
           ui-monospace, Menlo,
           "PingFang SC", "Hiragino Sans GB", monospace;
         font-size: 12px;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         font-weight: 500;
         margin-right: 14px;
         letter-spacing: 0.05em;
@@ -145,7 +152,7 @@
       }
       p { margin-bottom: 14px; }
       p + p { margin-top: -2px; }
-      a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-soft); }
+      a { color: var(--accent-text); text-decoration: none; border-bottom: 1px solid var(--accent-soft); }
       a:hover { border-bottom-color: var(--accent); }
       code {
         font-family:
@@ -188,6 +195,18 @@
         margin: 14px 0 18px;
         font-size: 14px;
       }
+      caption {
+        caption-side: top;
+        text-align: left;
+        padding: 0 0 8px;
+        color: var(--text-muted);
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+      }
       th, td {
         text-align: left;
         padding: 10px 12px;
@@ -202,7 +221,7 @@
         font-size: 12px;
         text-transform: uppercase;
         letter-spacing: 0.06em;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         border-bottom: 1px solid var(--rule);
       }
       tbody tr:hover { background: rgba(0,0,0,0.015); }
@@ -212,7 +231,7 @@
           "PingFang SC", "Hiragino Sans GB", monospace;
         font-size: 13px;
       }
-      td.accent { color: var(--accent); font-weight: 500; }
+      td.accent { color: var(--accent-text); font-weight: 500; }
 
       /* ─── Callouts ─── */
       .callout {
@@ -239,15 +258,15 @@
         font-size: 10.5px;
         letter-spacing: 0.12em;
         text-transform: uppercase;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         margin-bottom: 8px;
         font-weight: 600;
       }
-      .callout.warn .callout-label { color: var(--warn); }
+      .callout.warn .callout-label { color: var(--warn-text); }
       .cite-source {
         font-style: normal;
         font-size: 12px;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         margin-top: 10px;
         font-family:
           ui-monospace, Menlo,
@@ -269,13 +288,13 @@
         font-size: 11px;
         letter-spacing: 0.08em;
         text-transform: uppercase;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         padding: 10px 16px;
         border-top: 1px solid var(--rule-soft);
         background: var(--paper-edge);
       }
       figcaption .fig-num {
-        color: var(--accent);
+        color: var(--accent-text);
         margin-right: 10px;
         font-weight: 600;
       }
@@ -303,7 +322,7 @@
         text-transform: uppercase;
         margin-bottom: 8px;
         font-weight: 600;
-        color: var(--accent);
+        color: var(--accent-text);
       }
       .card-name {
         font-family:
@@ -315,16 +334,16 @@
       }
       .card-where {
         font-size: 12px;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         font-style: italic;
         margin-bottom: 10px;
       }
       .card-desc { font-size: 13px; color: var(--ink-soft); line-height: 1.5; }
 
       /* tone variants for cards */
-      .card.tone-a .card-icon { color: var(--brain); }
-      .card.tone-b .card-icon { color: var(--hands); }
-      .card.tone-c .card-icon { color: var(--session); }
+      .card.tone-a .card-icon { color: var(--accent-text); }
+      .card.tone-b .card-icon { color: var(--warn-text); }
+      .card.tone-c .card-icon { color: var(--session-text); }
 
       /* ─── Buttons / Inputs (for interactive sections) ─── */
       .btn {
@@ -372,7 +391,7 @@
         font-size: 11px;
         letter-spacing: 0.08em;
         text-transform: uppercase;
-        color: var(--ink-faint);
+        color: var(--text-muted);
         display: block;
         margin-bottom: 4px;
       }
@@ -383,7 +402,7 @@
         padding-top: 24px;
         border-top: 1px solid var(--rule);
         font-size: 12px;
-        color: var(--ink-faint);
+        color: var(--text-muted);
       }
       footer h4 {
         font-size: 11px;
@@ -474,8 +493,9 @@
       <section>
         <h2><span class="num">02</span>关键改动</h2>
         <table>
+          <caption>数据源优先级改造的能力、最终行为与保护边界</caption>
           <thead>
-            <tr><th>能力</th><th>最终行为</th><th>保护边界</th></tr>
+            <tr><th scope="col">能力</th><th scope="col">最终行为</th><th scope="col">保护边界</th></tr>
           </thead>
           <tbody>
             <tr><td><strong>实时行情</strong></td><td>默认 Tencent → Sina → Efinance → Eastmoney</td><td>Token 不再自动注入 Tushare</td></tr>
@@ -501,8 +521,9 @@ broad review e42c9e7..aa6a36c      NO BLOCKER / IMPORTANT</code></pre>
       <section>
         <h2><span class="num">04</span>两股运行时读回</h2>
         <table>
+          <caption>600797 与 002315 的实时、日线、筹码与结构化来源读回</caption>
           <thead>
-            <tr><th>股票</th><th>实时 / 日线 / 筹码</th><th>结构化 DataSourceEvidence</th></tr>
+            <tr><th scope="col">股票</th><th scope="col">实时 / 日线 / 筹码</th><th scope="col">结构化 DataSourceEvidence</th></tr>
           </thead>
           <tbody>
             <tr>
