@@ -2625,6 +2625,40 @@ class DataFetcherManager:
         }
 
     @staticmethod
+    def _refresh_fundamental_context_metadata(result_ctx: Dict[str, Any], is_etf: bool) -> None:
+        """根据各基本面块重新汇总顶层派生字段，避免缓存复用时元数据漂移。"""
+        block_names = (
+            "valuation",
+            "growth",
+            "earnings",
+            "institution",
+            "capital_flow",
+            "dragon_tiger",
+            "boards",
+        )
+        block_statuses = {
+            block: result_ctx[block].get("status", "not_supported")
+            for block in block_names
+        }
+        result_ctx["coverage"] = block_statuses
+        result_ctx["errors"] = []
+        result_ctx["source_chain"] = []
+        for block in block_names:
+            result_ctx["errors"].extend(result_ctx[block].get("errors", []))
+            result_ctx["source_chain"].extend(result_ctx[block].get("source_chain", []))
+
+        if is_etf:
+            result_ctx["status"] = (
+                "not_supported" if all(value == "not_supported" for value in block_statuses.values()) else "partial"
+            )
+        elif all(value == "not_supported" for value in block_statuses.values()):
+            result_ctx["status"] = "not_supported"
+        elif "failed" in block_statuses.values() or "partial" in block_statuses.values():
+            result_ctx["status"] = "partial"
+        else:
+            result_ctx["status"] = "ok"
+
+    @staticmethod
     def _has_meaningful_payload(payload: Any) -> bool:
         if payload is None:
             return False
@@ -2995,7 +3029,7 @@ class DataFetcherManager:
                     age = time.time() - float(cache_item.get("ts", 0))
                     if age <= cache_ttl:
                         cached_context = cache_item.get("context", {})
-                        if realtime_quote is None or not isinstance(cached_context, dict):
+                        if realtime_quote is None or is_etf or not isinstance(cached_context, dict):
                             return cached_context
                         valuation_payload = {
                             "pe_ratio": getattr(realtime_quote, "pe_ratio", None),
@@ -3017,6 +3051,7 @@ class DataFetcherManager:
                         # 只替换本轮估值且复制顶层对象，避免新行情污染跨请求复用的缓存。
                         reused_context = dict(cached_context)
                         reused_context["valuation"] = valuation
+                        self._refresh_fundamental_context_metadata(reused_context, is_etf=False)
                         logger.info("[基本面] %s 缓存命中，估值复用本轮实时行情", stock_code)
                         return reused_context
 
@@ -3042,7 +3077,7 @@ class DataFetcherManager:
             remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
 
         valuation_timeout = min(fetch_timeout, remaining_seconds)
-        if realtime_quote is not None:
+        if realtime_quote is not None and not is_etf:
             # 同一报告复用同一行情快照，减少重复请求并避免估值与技术面口径漂移。
             quote_payload, valuation_err, valuation_ms = realtime_quote, None, 0
             logger.info("[基本面] %s 估值复用本轮实时行情", stock_code)
@@ -3239,39 +3274,7 @@ class DataFetcherManager:
                 budget_seconds=min(fetch_timeout, remaining_seconds),
             )
 
-        block_statuses = {
-            "valuation": result_ctx["valuation"].get("status", "not_supported"),
-            "growth": result_ctx["growth"].get("status", "not_supported"),
-            "earnings": result_ctx["earnings"].get("status", "not_supported"),
-            "institution": result_ctx["institution"].get("status", "not_supported"),
-            "capital_flow": result_ctx["capital_flow"].get("status", "not_supported"),
-            "dragon_tiger": result_ctx["dragon_tiger"].get("status", "not_supported"),
-            "boards": result_ctx["boards"].get("status", "not_supported"),
-        }
-        result_ctx["coverage"] = block_statuses
-        for block in (
-            "valuation",
-            "growth",
-            "earnings",
-            "institution",
-            "capital_flow",
-            "dragon_tiger",
-            "boards",
-        ):
-            result_ctx["errors"].extend(result_ctx[block].get("errors", []))
-            result_ctx["source_chain"].extend(result_ctx[block].get("source_chain", []))
-
-        if is_etf:
-            # Keep ETF downgrade semantics for overall status even when valuation is available.
-            result_ctx["status"] = (
-                "not_supported" if all(value == "not_supported" for value in block_statuses.values()) else "partial"
-            )
-        elif all(value == "not_supported" for value in block_statuses.values()):
-            result_ctx["status"] = "not_supported"
-        elif "failed" in block_statuses.values() or "partial" in block_statuses.values():
-            result_ctx["status"] = "partial"
-        else:
-            result_ctx["status"] = "ok"
+        self._refresh_fundamental_context_metadata(result_ctx, is_etf=is_etf)
 
         result_ctx["elapsed_ms"] = int((time.time() - start_ts) * 1000)
         if cache_ttl > 0 and self._should_cache_fundamental_context(result_ctx):
