@@ -31,6 +31,9 @@ concurrency:
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    env:
+      # Action 面向 A 股日报，统一使用北京时间，避免报告/通知沿用 runner 的 UTC 时钟。
+      TZ: Asia/Shanghai
     # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
     # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
     environment: STOCK_LIST

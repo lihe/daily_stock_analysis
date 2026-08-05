@@ -254,7 +254,7 @@ _REPORT_LABELS: Dict[str, Dict[str, str]] = {
         "support_level_label": "支撑位",
         "resistance_level_label": "压力位",
         "chip_label": "筹码",
-        "phase_decision_heading": "盘中决策护栏",
+        "phase_decision_heading": "阶段决策护栏",
         "action_window_label": "行动窗口",
         "immediate_action_label": "当前动作",
         "watch_conditions_label": "观察条件",

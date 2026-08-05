@@ -332,6 +332,35 @@ def test_technical_missing_and_realtime_overlay_statuses_are_explicit() -> None:
     assert explicit_block.metadata["estimated_fields"] == ["close", "ma5"]
 
 
+def test_postmarket_realtime_snapshot_is_not_labeled_intraday_overlay() -> None:
+    pack = AnalysisContextBuilder.build(
+        _artifacts(
+            phase={
+                "market": "cn",
+                "phase": "postmarket",
+                "is_partial_bar": False,
+            },
+            enhanced_context={
+                "today": {
+                    "close": 1880.0,
+                    "data_source": "realtime:tencent",
+                    "is_partial_bar": False,
+                    "is_estimated": True,
+                    "estimated_fields": ["close", "ma5"],
+                }
+            },
+        )
+    )
+    block = pack.blocks["technical"]
+
+    assert block.status == ContextFieldStatus.AVAILABLE
+    assert "intraday_overlay" not in block.items
+    assert "intraday_realtime_overlay" not in block.warnings
+    assert "intraday_realtime_overlay" not in pack.data_quality.warnings
+    assert block.metadata["is_estimated"] is False
+    assert "estimated_fields" not in block.metadata
+
+
 def test_chip_missing_defaults_to_missing_and_explicit_not_supported() -> None:
     missing = AnalysisContextBuilder.build(_artifacts(chip_data=None)).blocks["chip"]
     assert missing.status == ContextFieldStatus.MISSING

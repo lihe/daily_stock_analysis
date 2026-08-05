@@ -258,11 +258,14 @@ def _build_technical_block(
             [],
         )
 
-    explicit_intraday_overlay = _has_explicit_intraday_overlay(
-        artifacts.enhanced_context
+    finalized_postmarket = _is_finalized_postmarket_snapshot(artifacts.phase)
+    explicit_intraday_overlay = (
+        not finalized_postmarket
+        and _has_explicit_intraday_overlay(artifacts.enhanced_context)
     )
-    has_realtime_overlay = explicit_intraday_overlay or _has_realtime_overlay(
-        artifacts.enhanced_context
+    has_realtime_overlay = explicit_intraday_overlay or (
+        not finalized_postmarket
+        and _has_realtime_overlay(artifacts.enhanced_context)
     )
     warnings = [_REALTIME_OVERLAY_WARNING] if has_realtime_overlay else []
     block_status = (
@@ -300,12 +303,12 @@ def _build_technical_block(
                     ),
                     "is_estimated": _today_metadata_value(
                         artifacts.enhanced_context, "is_estimated", "isEstimated"
-                    ),
+                    ) if not finalized_postmarket else False,
                     "estimated_fields": _today_metadata_value(
                         artifacts.enhanced_context,
                         "estimated_fields",
                         "estimatedFields",
-                    ),
+                    ) if not finalized_postmarket else None,
                 }.items()
                 if value is not None
             },
@@ -716,6 +719,15 @@ def _has_explicit_intraday_overlay(enhanced_context: Dict[str, Any]) -> bool:
         return True
     estimated_fields = today.get("estimated_fields") or today.get("estimatedFields")
     return bool(estimated_fields)
+
+
+def _is_finalized_postmarket_snapshot(phase: Any) -> bool:
+    if not isinstance(phase, Mapping):
+        return False
+    return (
+        str(phase.get("phase") or "").strip() == "postmarket"
+        and phase.get("is_partial_bar") is False
+    )
 
 
 def _has_realtime_overlay(enhanced_context: Dict[str, Any]) -> bool:

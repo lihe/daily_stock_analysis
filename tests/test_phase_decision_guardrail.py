@@ -275,6 +275,7 @@ def test_intraday_postmarket_recap_wording_is_adjusted_in_zh_and_en() -> None:
 def test_postmarket_recap_and_missing_inputs_are_fail_open() -> None:
     postmarket = _result(
         operation_advice="今日收盘后复盘显示可持有",
+        decision_type="hold",
         dashboard={
             "core_conclusion": {"one_sentence": "今日收盘后复盘显示可持有"},
             "phase_decision": {"watch_conditions": ["不破支撑"]},
@@ -303,6 +304,101 @@ def test_postmarket_recap_and_missing_inputs_are_fail_open() -> None:
     assert adjustments == []
     assert missing.dashboard["phase_decision"]["watch_conditions"] == []
     assert missing.dashboard["phase_decision"]["data_limitations"] == []
+
+
+def test_postmarket_rewrites_intraday_action_window_and_past_check_time() -> None:
+    result = _result(
+        operation_advice="立即买入",
+        decision_type="buy",
+        dashboard={
+            "core_conclusion": {"one_sentence": "等待下一交易日确认"},
+            "phase_decision": {
+                "action_window": "盘中跟踪",
+                "immediate_action": "立即买入",
+                "watch_conditions": ["观察次日承接"],
+                "next_check_time": "14:30",
+                "confidence_reason": "趋势偏强",
+                "data_limitations": [],
+            },
+        },
+    )
+    phase = _phase("postmarket")
+    phase["market_local_time"] = "2026-06-02T17:06:00+08:00"
+
+    adjustments = apply_phase_decision_guardrails(
+        result,
+        market_phase_summary=phase,
+        analysis_context_pack_overview=_overview("available"),
+        report_language="zh",
+    )
+
+    assert "postmarket_intraday_semantics_adjusted" in adjustments
+    phase_decision = result.dashboard["phase_decision"]
+    assert phase_decision["action_window"] == "盘后复盘"
+    assert phase_decision["immediate_action"] == "当前已收盘，无盘中动作；等待下一交易日确认。"
+    assert phase_decision["next_check_time"] == "下一交易日 09:25 集合竞价后"
+    assert result.decision_type == "buy"
+
+
+def test_postmarket_preserves_explicit_future_check_timestamp() -> None:
+    result = _result(
+        operation_advice="等待下一交易日确认",
+        decision_type="hold",
+        analysis_summary="盘后复盘",
+        dashboard={
+            "core_conclusion": {"one_sentence": "等待下一交易日确认"},
+            "phase_decision": {
+                "action_window": "盘后复盘",
+                "immediate_action": "当前已收盘，无盘中动作；等待下一交易日确认。",
+                "watch_conditions": ["观察次日承接"],
+                "next_check_time": "2026-06-03 09:15",
+                "confidence_reason": "等待次日确认",
+                "data_limitations": [],
+            },
+        },
+    )
+    phase = _phase("postmarket")
+    phase["market_local_time"] = "2026-06-02T17:06:00+08:00"
+
+    adjustments = apply_phase_decision_guardrails(
+        result,
+        market_phase_summary=phase,
+        analysis_context_pack_overview=_overview("available"),
+        report_language="zh",
+    )
+
+    assert adjustments == []
+    assert result.dashboard["phase_decision"]["next_check_time"] == "2026-06-03 09:15"
+
+
+def test_postmarket_rewrites_explicit_same_day_check_timestamp() -> None:
+    result = _result(
+        operation_advice="等待下一交易日确认",
+        decision_type="hold",
+        dashboard={
+            "core_conclusion": {"one_sentence": "等待下一交易日确认"},
+            "phase_decision": {
+                "action_window": "盘后复盘",
+                "immediate_action": "当前已收盘，无盘中动作；等待下一交易日确认。",
+                "watch_conditions": [],
+                "next_check_time": "2026-06-02 14:30",
+                "confidence_reason": "等待确认",
+                "data_limitations": [],
+            },
+        },
+    )
+    phase = _phase("postmarket")
+    phase["market_local_time"] = "2026-06-02T17:06:00+08:00"
+
+    adjustments = apply_phase_decision_guardrails(
+        result,
+        market_phase_summary=phase,
+        analysis_context_pack_overview=_overview("available"),
+        report_language="zh",
+    )
+
+    assert "postmarket_intraday_semantics_adjusted" in adjustments
+    assert result.dashboard["phase_decision"]["next_check_time"] == "下一交易日 09:25 集合竞价后"
 
 
 def test_guardrail_creates_dashboard_for_agent_compatible_result_object() -> None:

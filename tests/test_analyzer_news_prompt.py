@@ -310,6 +310,35 @@ class AnalyzerNewsPromptTestCase(unittest.TestCase):
         self.assertNotIn("### 今日行情", prompt)
         self.assertNotIn("| 收盘价 | 1880.0 元 |", prompt)
 
+    def test_format_prompt_labels_postmarket_snapshot_as_close_not_realtime(self) -> None:
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        context = {
+            "code": "600519",
+            "stock_name": "贵州茅台",
+            "date": "2026-03-27",
+            "today": {"close": 1880.0},
+            "realtime": {
+                "price": 1880.0,
+                "volume_ratio": 1.2,
+                "turnover_rate": 0.5,
+            },
+            "market_phase_context": {
+                "phase": "postmarket",
+                "is_partial_bar": False,
+                "warnings": [],
+            },
+        }
+
+        prompt = analyzer._format_prompt(context, "贵州茅台", news_context=None)
+
+        self.assertIn("### 收盘行情增强数据", prompt)
+        self.assertIn("| 收盘价格 | 1880.0 元 |", prompt)
+        self.assertNotIn("### 实时行情增强数据", prompt)
+        self.assertNotIn("| 当前价格 | 1880.0 元 |", prompt)
+        self.assertIn("近12个月每股现金分红 / 收盘价格 × 100%", prompt)
+
     def test_format_prompt_uses_complete_daily_labels_for_premarket_and_non_trading(self) -> None:
         with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
             analyzer = GeminiAnalyzer()

@@ -172,6 +172,22 @@ def _phase_aware_quote_labels(context: Dict[str, Any]) -> Tuple[str, str]:
     return "今日行情", "收盘价"
 
 
+def _phase_aware_realtime_labels(context: Dict[str, Any]) -> Tuple[str, str]:
+    """Use snapshot wording that matches the market phase."""
+    phase_context = context.get("market_phase_context")
+    if not isinstance(phase_context, dict):
+        return "实时行情增强数据", "当前价格"
+
+    phase = str(phase_context.get("phase") or "").strip()
+    if phase == "postmarket":
+        return "收盘行情增强数据", "收盘价格"
+    if phase in {"intraday", "lunch_break", "closing_auction"}:
+        return "盘中行情增强数据", "盘中价格"
+    if phase in {"premarket", "non_trading"}:
+        return "最新行情增强数据", "最新价格"
+    return "实时行情增强数据", "当前价格"
+
+
 def _should_hide_regular_session_ohlc(context: Dict[str, Any]) -> bool:
     phase_context = context.get("market_phase_context")
     if not isinstance(phase_context, dict):
@@ -3323,6 +3339,7 @@ class GeminiAnalyzer:
         unknown_text = get_unknown_text(report_language)
         no_data_text = get_no_data_text(report_language)
         quote_section_title, close_price_label = _phase_aware_quote_labels(context)
+        realtime_section_title, realtime_price_label = _phase_aware_realtime_labels(context)
         hide_regular_session_ohlc = _should_hide_regular_session_ohlc(context)
         realtime_overlay_quote = hide_regular_session_ohlc and _today_has_realtime_overlay(today)
         pct_chg_label = "实时涨跌幅" if realtime_overlay_quote else "涨跌幅"
@@ -3394,10 +3411,10 @@ class GeminiAnalyzer:
         if 'realtime' in context:
             rt = context['realtime']
             prompt += f"""
-### 实时行情增强数据
+### {realtime_section_title}
 | 指标 | 数值 | 解读 |
 |------|------|------|
-| 当前价格 | {rt.get('price', 'N/A')} 元 | |
+| {realtime_price_label} | {rt.get('price', 'N/A')} 元 | |
 | **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
 | **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
@@ -3446,7 +3463,7 @@ class GeminiAnalyzer:
 | 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
 | ROE | {financial_report.get('roe', 'N/A')} | |
 | 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
-| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
+| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / {realtime_price_label} × 100% |
 | TTM 分红事件数 | {ttm_count} | |
 
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。

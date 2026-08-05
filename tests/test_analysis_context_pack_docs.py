@@ -520,7 +520,7 @@ def test_full_guides_clarify_pack_summary_does_not_replace_legacy_payload_channe
     assert "同步分析响应也会读取本次已落库的 `analysis_history.context_snapshot` 提取 overview" in guide
     assert "`SAVE_CONTEXT_SNAPSHOT=false` 时新记录不保证返回该字段" in guide
     assert "AnalysisContextPack 数据质量评分与 Prompt 数据限制（Issue #1389 P5）" in guide
-    assert "盘中决策护栏与质量校验（Issue #1386 P5）" in guide
+    assert "阶段决策护栏与质量校验（Issue #1386 P5）" in guide
     assert "`dashboard.phase_decision`" in guide
     assert "`fetch_failed`" in guide
     assert "折叠头部新增质量分/等级" in guide
@@ -544,7 +544,7 @@ def test_full_guides_clarify_pack_summary_does_not_replace_legacy_payload_channe
     assert "sync analysis responses also extract the overview from the just-persisted `analysis_history.context_snapshot`" in guide_en
     assert "new records do not guarantee this field when `SAVE_CONTEXT_SNAPSHOT=false`" in guide_en
     assert "AnalysisContextPack Data Quality Scoring and Prompt Limitations (Issue #1389 P5)" in guide_en
-    assert "Intraday Decision Guardrails and Quality Checks (Issue #1386 P5)" in guide_en
+    assert "Phase Decision Guardrails and Quality Checks (Issue #1386 P5)" in guide_en
     assert "`dashboard.phase_decision`" in guide_en
     assert "`fetch_failed`" in guide_en
     assert "adds quality score/level to the header" in guide_en

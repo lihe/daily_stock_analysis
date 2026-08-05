@@ -10,11 +10,13 @@ Any expensive data preparation should be injected by the caller via extra_contex
 """
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.analyzer import AnalysisResult
 from src.config import get_config
+from src.core.trading_calendar import get_market_now
 from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
 from src.services.decision_signal_summary import format_decision_signal_excerpt
 from src.services.hhxg_data_service import render_hhxg_data_evidence
@@ -33,6 +35,17 @@ from src.report_language import (
 from src.utils.data_processing import normalize_model_used
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_report_now(results: List[AnalysisResult]) -> datetime:
+    market: Optional[str] = None
+    for result in results or []:
+        summary = getattr(result, "market_phase_summary", None)
+        if isinstance(summary, dict) and summary.get("market"):
+            market = str(summary["market"]).strip() or None
+            break
+    report_now = get_market_now(market)
+    return report_now if report_now.tzinfo is not None else report_now.astimezone()
 
 
 def _escape_md(text: str) -> str:
@@ -92,16 +105,15 @@ def render(
     Returns:
         Rendered string, or None on error (caller should fallback).
     """
-    from datetime import datetime
-
     try:
         from jinja2 import Environment, FileSystemLoader, select_autoescape
     except ImportError:
         logger.warning("jinja2 not installed, report renderer disabled")
         return None
 
+    report_now = _resolve_report_now(results)
     if report_date is None:
-        report_date = datetime.now().strftime("%Y-%m-%d")
+        report_date = report_now.strftime("%Y-%m-%d")
 
     templates_dir = _resolve_templates_dir()
     template_name = f"report_{platform}.j2"
@@ -147,7 +159,7 @@ def render(
                 models_used.append(model)
         models_used = list(dict.fromkeys(models_used))
 
-    report_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report_timestamp = report_now.isoformat(sep=" ", timespec="seconds")
 
     def failed_checks(checklist: List[str]) -> List[str]:
         return [c for c in (checklist or []) if c.startswith("❌") or c.startswith("⚠️")]

@@ -9,7 +9,9 @@ Tests for Jinja2 report rendering and fallback behavior.
 
 import sys
 import unittest
+from datetime import datetime
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 try:
     import litellm  # noqa: F401
@@ -128,7 +130,8 @@ class TestReportRenderer(unittest.TestCase):
         out = render("markdown", [r], summary_only=False)
 
         self.assertIsNotNone(out)
-        self.assertIn("盘中决策护栏", out)
+        self.assertIn("阶段决策护栏", out)
+        self.assertNotIn("盘中决策护栏", out)
         self.assertIn("盘中跟踪", out)
         self.assertIn("放量突破", out)
         self.assertIn("quote: stale", out)
@@ -236,6 +239,17 @@ class TestReportRenderer(unittest.TestCase):
         self.assertNotIn("限制: news: missing", out)
         self.assertNotIn("technical: fallback", out)
         self.assertNotIn("raw context pack", out)
+
+    def test_render_uses_market_timezone_for_report_clock(self) -> None:
+        r = _make_result()
+        r.market_phase_summary = {"phase": "postmarket", "market": "cn"}
+        market_now = datetime(2026, 8, 5, 17, 8, 42, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        with patch("src.services.report_renderer.get_market_now", return_value=market_now):
+            out = render("markdown", [r], summary_only=False)
+
+        self.assertIsNotNone(out)
+        self.assertIn("报告生成时间：2026-08-05 17:08:42+08:00", out)
 
     def test_render_templates_skip_phase_pack_excerpt_when_summary_missing(self) -> None:
         r = _make_result()

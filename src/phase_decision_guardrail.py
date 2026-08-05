@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from src.analysis_context_pack_prompt import CORE_DEGRADED_STATUSES
@@ -67,6 +69,8 @@ _IMMEDIATE_ACTION_MARKERS_ZH = (
 _IMMEDIATE_ACTION_MARKERS_EN = ("buy now", "sell now", "immediate buy", "immediate sell", "add now", "reduce now")
 _NEGATION_PREFIXES_ZH = ("暂不", "不建议", "禁止", "不要", "无需", "避免", "不能", "不可", "不宜", "勿", "不")
 _NEGATION_PREFIXES_EN = ("do not", "don't", "dont", "not", "no", "avoid", "hold off", "without")
+_POSTMARKET_FUTURE_CHECK_MARKERS_ZH = ("下一交易日", "次日", "明日", "下个交易日")
+_POSTMARKET_FUTURE_CHECK_MARKERS_EN = ("next session", "next trading day", "tomorrow")
 
 
 def apply_phase_decision_guardrails(
@@ -148,6 +152,26 @@ def apply_phase_decision_guardrails(
         _replace_postmarket_recap_fields(result, phase_decision, language=language)
         _append_reason(phase_decision, reason)
         adjustments.append("postmarket_recap_wording_adjusted")
+
+    if phase == "postmarket" and _has_postmarket_intraday_semantics(
+        result,
+        phase_decision,
+        language=language,
+        market_local_time=phase_summary.get("market_local_time") if phase_summary else None,
+    ):
+        _replace_postmarket_intraday_semantics(
+            result,
+            phase_decision,
+            language=language,
+            market_local_time=phase_summary.get("market_local_time") if phase_summary else None,
+        )
+        reason = (
+            "The regular session has ended; immediate intraday action was replaced with a next-session checkpoint."
+            if language == "en"
+            else "常规交易时段已结束，已将即时盘中动作改为下一交易日确认。"
+        )
+        _append_reason(phase_decision, reason)
+        adjustments.append("postmarket_intraday_semantics_adjusted")
 
     if adjustments:
         phase_decision["data_limitations"] = _merge_limitations(
@@ -318,6 +342,102 @@ def _replace_postmarket_recap_fields(
         phase_decision["immediate_action"] = safe_action
 
 
+def _has_postmarket_intraday_semantics(
+    result: "AnalysisResult",
+    phase_decision: Mapping[str, Any],
+    *,
+    language: str,
+    market_local_time: Any,
+) -> bool:
+    action_window = _safe_text(phase_decision.get("action_window")).lower()
+    window_markers = (
+        ("intraday", "during the session", "near close")
+        if language == "en"
+        else ("盘中", "午间", "收盘前", "尾盘")
+    )
+    if any(marker in action_window for marker in window_markers):
+        return True
+    if _has_immediate_buy_sell_signal(result, phase_decision, language=language):
+        return True
+    return _postmarket_check_time_is_ambiguous(
+        phase_decision.get("next_check_time"),
+        language=language,
+        market_local_time=market_local_time,
+    )
+
+
+def _postmarket_check_time_is_ambiguous(
+    value: Any,
+    *,
+    language: str,
+    market_local_time: Any,
+) -> bool:
+    text = _safe_text(value).lower()
+    if not text:
+        return False
+    future_markers = (
+        _POSTMARKET_FUTURE_CHECK_MARKERS_EN
+        if language == "en"
+        else _POSTMARKET_FUTURE_CHECK_MARKERS_ZH
+    )
+    if any(marker in text for marker in future_markers):
+        return False
+    dated_check = _extract_iso_date(text)
+    market_date = _extract_iso_date(_safe_text(market_local_time))
+    if dated_check and market_date:
+        return dated_check <= market_date
+    return any(char.isdigit() for char in text) and ":" in text
+
+
+def _extract_iso_date(value: str) -> Optional[date]:
+    match = re.search(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)", value)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _replace_postmarket_intraday_semantics(
+    result: "AnalysisResult",
+    phase_decision: Dict[str, Any],
+    *,
+    language: str,
+    market_local_time: Any,
+) -> None:
+    safe_action = _safe_postmarket_action(language)
+    phase_decision["action_window"] = "Post-market recap" if language == "en" else "盘后复盘"
+    phase_decision["immediate_action"] = safe_action
+    if _postmarket_check_time_is_ambiguous(
+        phase_decision.get("next_check_time"),
+        language=language,
+        market_local_time=market_local_time,
+    ):
+        phase_decision["next_check_time"] = (
+            "After the next regular-session open"
+            if language == "en"
+            else "下一交易日 09:25 集合竞价后"
+        )
+
+    immediate_markers = _IMMEDIATE_ACTION_MARKERS_EN if language == "en" else _IMMEDIATE_ACTION_MARKERS_ZH
+    if _contains_non_negated_marker(
+        _safe_text(getattr(result, "operation_advice", "")),
+        immediate_markers,
+        language=language,
+    ):
+        result.operation_advice = safe_action
+
+    dashboard = getattr(result, "dashboard", None)
+    core = dashboard.get("core_conclusion") if isinstance(dashboard, dict) else None
+    if isinstance(core, dict) and _contains_non_negated_marker(
+        _safe_text(core.get("one_sentence")),
+        immediate_markers,
+        language=language,
+    ):
+        core["one_sentence"] = safe_action
+
+
 def _append_reason(phase_decision: Dict[str, Any], reason: str) -> None:
     existing = _safe_text(phase_decision.get("confidence_reason"))
     if not existing:
@@ -336,6 +456,8 @@ def _adjustment_limitation_text(adjustment: str, *, language: str) -> str:
         return "confidence capped for non-intraday action" if language == "en" else "非盘中阶段已限制买卖置信度"
     if adjustment == "confidence_capped_core_data_degraded":
         return "confidence capped due to degraded core data" if language == "en" else "核心数据受限已降低置信度"
+    if adjustment == "postmarket_intraday_semantics_adjusted":
+        return "post-market intraday wording adjusted" if language == "en" else "盘后即时盘中语义已修正"
     return adjustment
 
 
@@ -344,6 +466,14 @@ def _safe_wait_action(language: str) -> str:
         "Wait for intraday confirmation; do not chase."
         if language == "en"
         else "等待盘中确认，禁止追高。"
+    )
+
+
+def _safe_postmarket_action(language: str) -> str:
+    return (
+        "The regular session is closed; no intraday action is available. Wait for next-session confirmation."
+        if language == "en"
+        else "当前已收盘，无盘中动作；等待下一交易日确认。"
     )
 
 

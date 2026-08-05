@@ -58,6 +58,12 @@ def _load_daily_analysis_env() -> dict[str, str]:
     return analyze_step["env"]
 
 
+def test_daily_analysis_uses_beijing_timezone_for_action_clock() -> None:
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    assert workflow["jobs"]["analyze"]["env"]["TZ"] == "Asia/Shanghai"
+
+
 def test_daily_analysis_maps_all_provider_template_channels() -> None:
     templates = _extract_provider_templates()
     env = _load_daily_analysis_env()
