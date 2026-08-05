@@ -64,6 +64,16 @@ def test_daily_analysis_uses_beijing_timezone_for_action_clock() -> None:
     assert workflow["jobs"]["analyze"]["env"]["TZ"] == "Asia/Shanghai"
 
 
+def test_daily_analysis_random_delay_only_runs_for_schedule() -> None:
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["analyze"]["steps"]
+    delay_step = next(
+        step for step in steps if step.get("name") == "随机延迟（避免固定时间访问）"
+    )
+
+    assert delay_step.get("if") == "github.event_name == 'schedule'"
+
+
 def test_daily_analysis_maps_all_provider_template_channels() -> None:
     templates = _extract_provider_templates()
     env = _load_daily_analysis_env()

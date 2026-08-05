@@ -42,7 +42,8 @@ jobs:
     
     steps:
       - name: 随机延迟（避免固定时间访问）
-        run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
+        if: github.event_name == 'schedule'
+        run: sleep $((RANDOM % 60))  # 随机延迟0-59秒启动
       
       - name: 检出代码
         uses: actions/checkout@v5
