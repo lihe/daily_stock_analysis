@@ -68,7 +68,7 @@ from .base import (
 from .realtime_types import (
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker,
-    safe_float, safe_int  # 使用统一的类型转换函数
+    safe_float  # 使用统一的类型转换函数
 )
 
 
@@ -147,6 +147,33 @@ _etf_realtime_cache: Dict[str, Any] = {
 
 _ETF_SH_PREFIXES = ('51', '52', '56', '58')
 _ETF_SZ_PREFIXES = ('15', '16', '18')
+
+
+def _normalize_efinance_volume(
+    volume: Any,
+    amount: Any = None,
+    price: Any = None,
+) -> Optional[int]:
+    """将 efinance 成交量统一为股，并兼容上游单位变化。"""
+    raw_volume = safe_float(volume)
+    if raw_volume is None or raw_volume < 0:
+        return None
+
+    raw_amount = safe_float(amount)
+    raw_price = safe_float(price)
+    if raw_amount is not None and raw_amount > 0 and raw_price is not None and raw_price > 0:
+        estimated_shares = raw_amount / raw_price
+        share_candidate = raw_volume
+        lot_candidate = raw_volume * 100
+
+        # efinance 当前 A 股/ETF 成交量通常以“手”返回；用成交额反推股数，
+        # 可防止上游未来改成“股”后再次乘 100。
+        if abs(share_candidate - estimated_shares) <= abs(lot_candidate - estimated_shares):
+            return int(round(share_candidate))
+        return int(round(lot_candidate))
+
+    # 缺少成交额或价格时遵循 efinance 当前接口口径：1 手 = 100 股。
+    return int(round(raw_volume * 100))
 
 
 def _is_etf_code(stock_code: str) -> bool:
@@ -608,6 +635,12 @@ class EfinanceFetcher(BaseFetcher):
         if 'amount' not in df.columns:
             df['amount'] = 0
 
+        close_values = df['close'] if 'close' in df.columns else [None] * len(df)
+        df['volume'] = [
+            _normalize_efinance_volume(volume, amount, close) or 0
+            for volume, amount, close in zip(df['volume'], df['amount'], close_values)
+        ]
+
         
         # 如果没有 code 列，手动添加
         if 'code' not in df.columns:
@@ -705,16 +738,19 @@ class EfinanceFetcher(BaseFetcher):
             pe_col = '市盈率' if '市盈率' in df.columns else 'pe_ratio'
             total_mv_col = '总市值' if '总市值' in df.columns else 'total_mv'
             circ_mv_col = '流通市值' if '流通市值' in df.columns else 'circ_mv'
+
+            price = safe_float(row.get(price_col))
+            amount = safe_float(row.get(amt_col))
             
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=str(row.get(name_col, '')),
                 source=RealtimeSource.EFINANCE,
-                price=safe_float(row.get(price_col)),
+                price=price,
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
-                amount=safe_float(row.get(amt_col)),
+                volume=_normalize_efinance_volume(row.get(vol_col), amount, price),
+                amount=amount,
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
                 high=safe_float(row.get(high_col)),
@@ -807,15 +843,18 @@ class EfinanceFetcher(BaseFetcher):
             low_col = '最低' if '最低' in df.columns else 'low'
             open_col = '开盘' if '开盘' in df.columns else 'open'
 
+            price = safe_float(row.get(price_col))
+            amount = safe_float(row.get(amt_col))
+
             quote = UnifiedRealtimeQuote(
                 code=target_code,
                 name=str(row.get(name_col, '')),
                 source=RealtimeSource.EFINANCE,
-                price=safe_float(row.get(price_col)),
+                price=price,
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
-                amount=safe_float(row.get(amt_col)),
+                volume=_normalize_efinance_volume(row.get(vol_col), amount, price),
+                amount=amount,
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
                 high=safe_float(row.get(high_col)),
