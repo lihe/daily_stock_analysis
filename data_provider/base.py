@@ -14,8 +14,10 @@
 3. 指数退避重试机制
 """
 
+import json
 import logging
 import random
+import re
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
@@ -2698,6 +2700,158 @@ class DataFetcherManager:
             result_ctx["status"] = "ok"
 
     @staticmethod
+    def _normalize_evidence_status(value: Any) -> str:
+        """将状态约束到稳定枚举，避免把上游自由文本带入证据日志。"""
+        normalized = str(value or "").strip().lower()
+        aliases = {
+            "success": "ok",
+            "error": "failed",
+            "unsupported": "not_supported",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized in {"ok", "partial", "failed", "not_supported", "disabled"}:
+            return normalized
+        return "unknown"
+
+    @staticmethod
+    def _sanitize_provider_endpoint(value: Any) -> Optional[str]:
+        """只保留 source_chain 中符合名称形态的来源，拒绝 URL、Token 和自由文本。"""
+        try:
+            name = str(value or "").strip()
+        except Exception:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,96}", name):
+            return None
+        if "token" in name.lower():
+            return None
+        return name
+
+    @staticmethod
+    def _classify_evidence_error(value: Any) -> str:
+        """把任意错误文本归一到有限安全类型，不回显完整异常消息。"""
+        try:
+            normalized = str(value or "")[:512].lower()
+        except Exception:
+            return "provider_error"
+        if "timeout" in normalized or "timed out" in normalized:
+            return "timeout"
+        if "deadline" in normalized:
+            return "deadline_exhausted"
+        if "rate limit" in normalized or "ratelimit" in normalized or "429" in normalized:
+            return "rate_limited"
+        if "permissionerror" in normalized or "permission denied" in normalized or "forbidden" in normalized:
+            return "permission_denied"
+        if "authentication" in normalized or "unauthorized" in normalized:
+            return "authentication"
+        if any(marker in normalized for marker in ("connectionerror", "connection reset", "dns", "sslerror")):
+            return "connection"
+        if any(marker in normalized for marker in ("valueerror", "typeerror", "keyerror", "jsondecodeerror")):
+            return "invalid_response"
+        if "not_supported" in normalized or "not supported" in normalized:
+            return "not_supported"
+        if "disabled" in normalized:
+            return "disabled"
+        if "partial" in normalized:
+            return "partial"
+        if "failed" in normalized or "failure" in normalized:
+            return "failed"
+        return "provider_error"
+
+    @classmethod
+    def _build_fundamental_source_evidence(
+        cls,
+        stock_code: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """从规范化 context 构建不含业务数据值的机器可解析证据。"""
+        block_names = (
+            "valuation",
+            "growth",
+            "earnings",
+            "institution",
+            "capital_flow",
+            "dragon_tiger",
+            "boards",
+        )
+        coverage_payload = context.get("coverage", {}) if isinstance(context, dict) else {}
+        if not isinstance(coverage_payload, dict):
+            coverage_payload = {}
+
+        blocks: Dict[str, Dict[str, Any]] = {}
+        coverage: Dict[str, str] = {}
+        for block_name in block_names:
+            block = context.get(block_name, {}) if isinstance(context, dict) else {}
+            if not isinstance(block, dict):
+                block = {}
+            status = cls._normalize_evidence_status(block.get("status"))
+            coverage[block_name] = cls._normalize_evidence_status(
+                coverage_payload.get(block_name, status)
+            )
+
+            provider_endpoints: List[Dict[str, str]] = []
+            seen_sources = set()
+            source_chain = block.get("source_chain", [])
+            if not isinstance(source_chain, (list, tuple)):
+                source_chain = [source_chain]
+            for source in source_chain:
+                if isinstance(source, dict):
+                    name = cls._sanitize_provider_endpoint(source.get("provider"))
+                    result = cls._normalize_evidence_status(source.get("result"))
+                else:
+                    name = cls._sanitize_provider_endpoint(source)
+                    result = "unknown"
+                if name is None or (name, result) in seen_sources:
+                    continue
+                seen_sources.add((name, result))
+                provider_endpoints.append({"name": name, "result": result})
+
+            error_values = block.get("errors", [])
+            if not isinstance(error_values, (list, tuple)):
+                error_values = [error_values]
+            error_types: List[str] = []
+            for error in error_values:
+                error_type = cls._classify_evidence_error(error)
+                if error_type not in error_types:
+                    error_types.append(error_type)
+
+            blocks[block_name] = {
+                "status": status,
+                "provider_endpoints": provider_endpoints,
+                "error_types": error_types,
+            }
+
+        return {
+            "stock_code": normalize_stock_code(stock_code),
+            "overall_status": cls._normalize_evidence_status(
+                context.get("status") if isinstance(context, dict) else None
+            ),
+            "coverage": coverage,
+            "blocks": blocks,
+        }
+
+    @classmethod
+    def _emit_fundamental_source_evidence(
+        cls,
+        stock_code: str,
+        context: Dict[str, Any],
+    ) -> None:
+        """以单行稳定 JSON 记录证据；日志失败不得改变基本面返回契约。"""
+        try:
+            evidence = cls._build_fundamental_source_evidence(stock_code, context)
+        except Exception:
+            evidence = {
+                "stock_code": normalize_stock_code(stock_code),
+                "overall_status": "unknown",
+                "coverage": {},
+                "blocks": {},
+                "error_types": ["serialization_error"],
+            }
+        logger.info(
+            "[DataSourceEvidence] %s",
+            json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        )
+
+    @staticmethod
     def _has_meaningful_payload(payload: Any) -> bool:
         if payload is None:
             return False
@@ -3319,10 +3473,14 @@ class DataFetcherManager:
 
         config = get_config()
         if not config.enable_fundamental_pipeline:
-            return self._build_market_not_supported(
+            disabled_context = self._build_market_not_supported(
                 market=_market_tag(stock_code),
                 reason="fundamental pipeline disabled",
             )
+            normalized_code = normalize_stock_code(stock_code)
+            if _market_tag(normalized_code) == "cn" and not _is_etf_code(normalized_code):
+                self._emit_fundamental_source_evidence(normalized_code, disabled_context)
+            return disabled_context
 
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
@@ -3353,6 +3511,8 @@ class DataFetcherManager:
                     if age <= cache_ttl:
                         cached_context = cache_item.get("context", {})
                         if realtime_quote is None or is_etf or not isinstance(cached_context, dict):
+                            if not is_etf:
+                                self._emit_fundamental_source_evidence(stock_code, cached_context)
                             return cached_context
                         valuation_payload = {
                             "pe_ratio": getattr(realtime_quote, "pe_ratio", None),
@@ -3376,6 +3536,7 @@ class DataFetcherManager:
                         reused_context["valuation"] = valuation
                         self._refresh_fundamental_context_metadata(reused_context, is_etf=False)
                         logger.info("[基本面] %s 缓存命中，估值复用本轮实时行情", stock_code)
+                        self._emit_fundamental_source_evidence(stock_code, reused_context)
                         return reused_context
 
         remaining_seconds = stage_timeout
@@ -3615,6 +3776,8 @@ class DataFetcherManager:
                     "context": result_ctx,
                 }
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+        if not is_etf:
+            self._emit_fundamental_source_evidence(stock_code, result_ctx)
         return result_ctx
 
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:

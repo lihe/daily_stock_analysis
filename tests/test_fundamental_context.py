@@ -3,6 +3,7 @@
 Tests for structured fundamental context (P0).
 """
 
+import json
 import os
 import sys
 import time
@@ -94,6 +95,136 @@ def _empty_bundle():
 
 
 class TestFundamentalContext(unittest.TestCase):
+    def test_cn_fundamental_context_logs_sanitized_source_evidence(self) -> None:
+        tushare = _TushareCapabilityFetcher(bundle={
+            "status": "partial",
+            "growth": {"revenue_yoy": 8.0},
+            "earnings": {"financial_report": {"revenue": 123456789.0}},
+            "institution": {
+                "top10_holder_snapshot": {"holders": [{"holder_name": "敏感股东名称"}]},
+                "top10_holder_change": 0.0,
+            },
+            "source_chain": ["tushare.fina_indicator", "tushare.income"],
+            "errors": [
+                "income:TimeoutError: Token SECRET_TOKEN https://api.example.test/raw?token=SECRET_TOKEN"
+            ],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        capital_flow = manager._build_fundamental_block(
+            "failed",
+            {},
+            [{"provider": "tushare.moneyflow", "result": "failed", "duration_ms": 7}],
+            ["ConnectionError: private upstream host and raw response body"],
+        )
+        dragon_tiger = manager._build_fundamental_block("not_supported")
+        boards = manager._build_fundamental_block(
+            "partial",
+            {},
+            [{
+                "provider": "boards:akshare_stock_board_industry_name_em",
+                "result": "partial",
+                "duration_ms": 3,
+            }],
+            ["arbitrary business error value 998877"],
+        )
+
+        with patch("src.config.get_config", return_value=_manager_config()), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch.object(manager, "get_capital_flow_context", return_value=capital_flow), \
+                patch.object(manager, "get_dragon_tiger_context", return_value=dragon_tiger), \
+                patch.object(manager, "get_board_context", return_value=boards), \
+                self.assertLogs("data_provider.base", level="INFO") as logs:
+            context = manager.get_fundamental_context("SH600519", budget_seconds=3.0)
+
+        evidence_lines = [
+            line.split("[DataSourceEvidence] ", 1)[1]
+            for line in logs.output
+            if "[DataSourceEvidence] " in line
+        ]
+        self.assertEqual(len(evidence_lines), 1)
+        evidence = json.loads(evidence_lines[0])
+        self.assertEqual(evidence["stock_code"], "600519")
+        self.assertEqual(evidence["overall_status"], context["status"])
+        self.assertEqual(evidence["coverage"], context["coverage"])
+        self.assertEqual(evidence["blocks"]["growth"]["status"], "ok")
+        self.assertEqual(
+            evidence["blocks"]["growth"]["provider_endpoints"],
+            [
+                {"name": "tushare.fina_indicator", "result": "partial"},
+                {"name": "tushare.income", "result": "partial"},
+            ],
+        )
+        self.assertEqual(evidence["blocks"]["growth"]["error_types"], ["timeout"])
+        self.assertEqual(evidence["blocks"]["capital_flow"]["error_types"], ["connection"])
+        self.assertEqual(evidence["blocks"]["boards"]["error_types"], ["provider_error"])
+
+        serialized = evidence_lines[0]
+        for secret in (
+            "SECRET_TOKEN",
+            "Token",
+            "https://",
+            "raw response body",
+            "敏感股东名称",
+            "123456789",
+            "998877",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertNotIn("duration_ms", serialized)
+
+    def test_cn_fundamental_context_cache_hit_logs_source_evidence_without_mutating_context(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = _manager_config()
+        cfg.fundamental_cache_ttl_seconds = 120
+        cfg.fundamental_cache_max_entries = 8
+        cached_context = {
+            "market": "cn",
+            "valuation": manager._build_fundamental_block(
+                "ok",
+                {"pe_ratio": 998877.0},
+                [{"provider": "realtime_quote", "result": "ok", "duration_ms": 1}],
+            ),
+            "growth": manager._build_fundamental_block(
+                "partial",
+                {"revenue_yoy": 7654321.0},
+                [{"provider": "growth:akshare_financial_analysis", "result": "partial", "duration_ms": 2}],
+                ["RuntimeError: Token CACHE_SECRET https://cache.example.test/raw"],
+            ),
+            "earnings": manager._build_fundamental_block("not_supported"),
+            "institution": manager._build_fundamental_block("not_supported"),
+            "capital_flow": manager._build_fundamental_block("not_supported"),
+            "dragon_tiger": manager._build_fundamental_block("not_supported"),
+            "boards": manager._build_fundamental_block("not_supported"),
+        }
+        manager._refresh_fundamental_context_metadata(cached_context, is_etf=False)
+        cache_key = manager._get_fundamental_cache_key("600519", 3.0)
+        manager._fundamental_cache[cache_key] = {"ts": time.time(), "context": cached_context}
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote") as fetch_quote, \
+                self.assertLogs("data_provider.base", level="INFO") as logs:
+            context = manager.get_fundamental_context("600519", budget_seconds=3.0)
+
+        fetch_quote.assert_not_called()
+        self.assertIs(context, cached_context)
+        evidence_lines = [
+            line.split("[DataSourceEvidence] ", 1)[1]
+            for line in logs.output
+            if "[DataSourceEvidence] " in line
+        ]
+        self.assertEqual(len(evidence_lines), 1)
+        evidence = json.loads(evidence_lines[0])
+        self.assertEqual(evidence["stock_code"], "600519")
+        self.assertEqual(evidence["overall_status"], "partial")
+        self.assertEqual(
+            evidence["blocks"]["growth"]["provider_endpoints"],
+            [{"name": "growth:akshare_financial_analysis", "result": "partial"}],
+        )
+        self.assertEqual(evidence["blocks"]["growth"]["error_types"], ["provider_error"])
+        serialized = evidence_lines[0]
+        for secret in ("CACHE_SECRET", "Token", "https://", "998877", "7654321"):
+            self.assertNotIn(secret, serialized)
+
     def test_no_tushare_fetcher_keeps_akshare_bundle_and_capital_flow_routes(self) -> None:
         manager = DataFetcherManager(fetchers=[_DummyFetcher("AkshareFetcher", priority=1)])
         quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
