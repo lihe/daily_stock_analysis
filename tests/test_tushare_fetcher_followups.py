@@ -8,7 +8,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pandas as pd
 
@@ -186,12 +186,24 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
             ]
         )
 
-        quote = fetcher.get_realtime_quote("SZ000001")
+        with patch.object(
+            fetcher,
+            "_call_api_with_rate_limit",
+            wraps=fetcher._call_api_with_rate_limit,
+        ) as api_wrapper:
+            quote = fetcher.get_realtime_quote("SZ000001")
 
         self.assertIsNotNone(quote)
         self.assertEqual(quote.code, "000001")
         self.assertEqual(quote.name, "平安银行")
         tushare_module.get_realtime_quotes.assert_called_once_with("000001")
+        self.assertEqual(
+            api_wrapper.call_args_list,
+            [
+                call("quotation", ts_code="000001.SZ"),
+                call("get_realtime_quotes", "000001", _target=tushare_module),
+            ],
+        )
 
     def test_structured_capabilities_route_every_endpoint_through_fetcher_callback(self) -> None:
         fetcher = self._make_fetcher()

@@ -280,9 +280,16 @@ class TushareFetcher(BaseFetcher):
             self._call_count += 1
             logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
 
-    def _call_api_with_rate_limit(self, method_name: str, **kwargs) -> pd.DataFrame:
+    def _call_api_with_rate_limit(
+        self,
+        method_name: str,
+        *args: Any,
+        _target: Optional[object] = None,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
         """统一通过速率限制包装 Tushare API 调用。"""
-        if self._api is None:
+        target = self._api if _target is None else _target
+        if target is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
 
         acquired = self._api_slots.acquire(timeout=30.0)
@@ -290,8 +297,8 @@ class TushareFetcher(BaseFetcher):
             raise RateLimitError("Tushare API 并发槽等待超时")
         try:
             self._check_rate_limit()
-            method = getattr(self._api, method_name)
-            return method(**kwargs)
+            method = getattr(target, method_name)
+            return method(*args, **kwargs)
         finally:
             self._api_slots.release()
 
@@ -778,7 +785,11 @@ class TushareFetcher(BaseFetcher):
             symbol = self._get_legacy_realtime_symbol(stock_code)
 
             # 调用旧版实时接口 (ts.get_realtime_quotes)
-            df = ts.get_realtime_quotes(symbol)
+            df = self._call_api_with_rate_limit(
+                "get_realtime_quotes",
+                symbol,
+                _target=ts,
+            )
 
             if df is None or df.empty:
                 return None
