@@ -10,7 +10,7 @@ import sys
 import time
 import unittest
 from datetime import datetime
-from threading import BoundedSemaphore, Event
+from threading import BoundedSemaphore, Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -560,6 +560,141 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertAlmostEqual(tushare.bundle_timeouts[0], 1.8)
         self.assertAlmostEqual(wrapper_timeouts[0][1], 1.8)
         self.assertAlmostEqual(wrapper_timeouts[1][1], 2.5)
+
+    def test_fundamental_bundle_lock_timeout_never_calls_tushare_after_return(self) -> None:
+        late_call = Event()
+
+        def preferred_bundle(_timeout_seconds):
+            late_call.set()
+            return _empty_bundle()
+
+        tushare = _TushareCapabilityFetcher(bundle=preferred_bundle)
+        manager = DataFetcherManager(fetchers=[tushare])
+        fetcher_lock = manager._get_fetcher_call_lock(tushare)
+        lock_held = Event()
+        release_lock = Event()
+        wrapper_timeouts = []
+        real_run_with_timeout = manager._run_with_timeout
+
+        def hold_preferred_lock() -> None:
+            with fetcher_lock:
+                lock_held.set()
+                release_lock.wait(timeout=2.0)
+
+        def record_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            return real_run_with_timeout(
+                task,
+                timeout_seconds,
+                task_name,
+                absolute_deadline=absolute_deadline,
+            )
+
+        fallback_payload = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 8.0},
+            "earnings": {},
+            "institution": {},
+            "source_chain": ["growth:akshare"],
+            "errors": [],
+        }
+        holder = Thread(target=hold_preferred_lock, daemon=True)
+        holder.start()
+        self.assertTrue(lock_held.wait(timeout=1.0))
+
+        try:
+            with patch("src.config.get_config", return_value=_manager_config(timeout=0.25)), \
+                    patch.object(manager, "_run_with_timeout", side_effect=record_timeout), \
+                    patch.object(
+                        manager._fundamental_adapter,
+                        "get_fundamental_bundle",
+                        return_value=fallback_payload,
+                    ):
+                payload, _ = manager._get_ordered_fundamental_bundle("600519", 0.25)
+            calls_at_return = len(tushare.bundle_timeouts)
+        finally:
+            release_lock.set()
+            holder.join(timeout=1.0)
+
+        called_after_release = late_call.wait(timeout=0.2)
+        providers = [item["provider"] for item in payload["source_chain"]]
+        fallback_timeouts = [
+            timeout
+            for task_name, timeout in wrapper_timeouts
+            if task_name == "akshare_fundamental_bundle"
+        ]
+        self.assertEqual(calls_at_return, 0)
+        self.assertFalse(called_after_release)
+        self.assertNotIn("tushare_fundamental_bundle", providers)
+        self.assertIn("growth:akshare", providers)
+        self.assertTrue(any("timeout" in error for error in payload["errors"]))
+        self.assertEqual(len(fallback_timeouts), 1)
+        self.assertGreater(fallback_timeouts[0], 0.0)
+        self.assertLess(fallback_timeouts[0], 0.25)
+
+    def test_fundamental_bundle_recomputes_tushare_timeout_after_lock_acquisition(self) -> None:
+        complete_bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 8.0},
+            "earnings": {"financial_report": {"revenue": 1.0}},
+            "institution": {"top10_holder_change": 0.0},
+            "source_chain": ["tushare.fina_indicator"],
+            "errors": [],
+        }
+        tushare = _TushareCapabilityFetcher(bundle=complete_bundle)
+        manager = DataFetcherManager(fetchers=[tushare])
+        fetcher_lock = manager._get_fetcher_call_lock(tushare)
+        lock_held = Event()
+        release_lock = Event()
+        call_started = Event()
+        wrapper_timeouts = []
+        real_run_with_timeout = manager._run_with_timeout
+
+        def hold_preferred_lock() -> None:
+            with fetcher_lock:
+                lock_held.set()
+                release_lock.wait(timeout=2.0)
+
+        def release_after_wait() -> None:
+            if call_started.wait(timeout=1.0):
+                time.sleep(0.1)
+            release_lock.set()
+
+        def record_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            return real_run_with_timeout(
+                task,
+                timeout_seconds,
+                task_name,
+                absolute_deadline=absolute_deadline,
+            )
+
+        holder = Thread(target=hold_preferred_lock, daemon=True)
+        releaser = Thread(target=release_after_wait, daemon=True)
+        holder.start()
+        self.assertTrue(lock_held.wait(timeout=1.0))
+        releaser.start()
+        try:
+            call_started.set()
+            with patch("src.config.get_config", return_value=_manager_config(timeout=1.0)), \
+                    patch.object(manager, "_run_with_timeout", side_effect=record_timeout), \
+                    patch.object(manager._fundamental_adapter, "get_fundamental_bundle") as ak_call:
+                payload, _ = manager._get_ordered_fundamental_bundle("600519", 1.0)
+        finally:
+            release_lock.set()
+            holder.join(timeout=1.0)
+            releaser.join(timeout=1.0)
+
+        preferred_timeout = next(
+            timeout
+            for task_name, timeout in wrapper_timeouts
+            if task_name == "tushare_fundamental_bundle"
+        )
+        injected_timeout = tushare.bundle_timeouts[0]
+        self.assertEqual(payload["growth"]["revenue_yoy"], 8.0)
+        self.assertGreater(injected_timeout, 0.0)
+        self.assertLess(injected_timeout, preferred_timeout - 0.05)
+        ak_call.assert_not_called()
 
     def test_fundamental_bundle_retry_passes_decreasing_preferred_deadline_remainder(self) -> None:
         clock = {"now": 50.0}

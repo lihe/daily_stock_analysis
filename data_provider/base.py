@@ -751,6 +751,43 @@ class DataFetcherManager:
         with self._get_fetcher_call_lock(fetcher):
             return method(*args, **kwargs)
 
+    def _call_ordered_capability_method(
+        self,
+        fetcher: Any,
+        method_name: str,
+        absolute_deadline: float,
+        mark_attempted: Callable[[], None],
+        args: Tuple[Any, ...],
+        kwargs: Optional[Dict[str, Any]] = None,
+        timeout_parameter: Optional[str] = None,
+    ) -> Any:
+        """在 ordered capability 的绝对截止时间内等待同一实例锁并调用 provider。"""
+        remaining = max(0.0, absolute_deadline - time.monotonic())
+        if remaining <= 0:
+            raise DataFetchError(f"{method_name} capability deadline exhausted")
+
+        lock = self._get_fetcher_call_lock(fetcher)
+        acquired = False
+        try:
+            acquired = lock.acquire(timeout=remaining)
+            if not acquired:
+                raise DataFetchError(f"{method_name} capability lock timeout")
+
+            # 等锁耗时属于同一预算；只有拿锁后的正余量才能传给支持 timeout 的 provider。
+            remaining = max(0.0, absolute_deadline - time.monotonic())
+            if remaining <= 0:
+                raise DataFetchError(f"{method_name} capability deadline exhausted")
+
+            call_kwargs = dict(kwargs or {})
+            if timeout_parameter:
+                call_kwargs[timeout_parameter] = remaining
+            method = getattr(fetcher, method_name)
+            mark_attempted()
+            return method(*args, **call_kwargs)
+        finally:
+            if acquired:
+                lock.release()
+
     @classmethod
     def _filter_daily_fetchers_for_market(
         cls,
@@ -3008,7 +3045,7 @@ class DataFetcherManager:
 
     def _run_ordered_capability_attempt(
         self,
-        task: Callable[[float], Any],
+        task: Callable[[Callable[[], None]], Any],
         absolute_deadline: float,
         task_name: str,
         provider: str,
@@ -3020,12 +3057,14 @@ class DataFetcherManager:
 
         attempted = {"value": False}
 
-        def run_provider() -> Any:
+        def mark_attempted() -> None:
             attempted["value"] = True
+
+        def run_provider() -> Any:
             remaining = max(0.0, absolute_deadline - time.monotonic())
             if remaining <= 0:
                 raise DataFetchError(f"{task_name} deadline exhausted")
-            return task(remaining)
+            return task(mark_attempted)
 
         payload, err, cost_ms = self._run_with_retry(
             run_provider,
@@ -3064,11 +3103,13 @@ class DataFetcherManager:
             # 首选切片锚定能力开始时刻，lookup 不能把切片向后平移。
             preferred_deadline = min(total_deadline, started_at + preferred_budget)
             preferred_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
-                lambda remaining: self._call_fetcher_method(
+                lambda mark_attempted: self._call_ordered_capability_method(
                     tushare,
                     "get_fundamental_bundle",
-                    stock_code,
-                    remaining,
+                    preferred_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                    timeout_parameter="timeout_seconds",
                 ),
                 preferred_deadline,
                 "tushare_fundamental_bundle",
@@ -3082,7 +3123,13 @@ class DataFetcherManager:
         needs_fallback = self._fundamental_bundle_needs_fallback(preferred_payload)
         if needs_fallback:
             fallback_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
-                lambda _remaining: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda mark_attempted: self._call_ordered_capability_method(
+                    self._fundamental_adapter,
+                    "get_fundamental_bundle",
+                    total_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                ),
                 total_deadline,
                 "akshare_fundamental_bundle",
                 "akshare_fundamental_bundle",
@@ -3128,12 +3175,14 @@ class DataFetcherManager:
             preferred_budget = min(1.8, total_budget * 0.6)
             preferred_deadline = min(total_deadline, started_at + preferred_budget)
             preferred_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
-                lambda remaining: self._call_fetcher_method(
+                lambda mark_attempted: self._call_ordered_capability_method(
                     tushare,
                     "get_capital_flow",
-                    stock_code,
-                    remaining,
-                    top_n=5,
+                    preferred_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                    {"top_n": 5},
+                    timeout_parameter="timeout_seconds",
                 ),
                 preferred_deadline,
                 "tushare_capital_flow",
@@ -3150,7 +3199,13 @@ class DataFetcherManager:
         sector_needs_fallback = not self._capital_sector_has_rankings(preferred_sector)
         if stock_needs_fallback or sector_needs_fallback:
             fallback_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
-                lambda _remaining: self._fundamental_adapter.get_capital_flow(stock_code),
+                lambda mark_attempted: self._call_ordered_capability_method(
+                    self._fundamental_adapter,
+                    "get_capital_flow",
+                    total_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                ),
                 total_deadline,
                 "akshare_capital_flow",
                 "akshare_capital_flow",

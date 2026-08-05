@@ -5,8 +5,9 @@ Contract tests for get_capital_flow tool output semantics.
 
 import os
 import sys
+import time
 import unittest
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -151,6 +152,158 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertAlmostEqual(tushare.capital_flow_timeouts[0][0], 1.8)
         self.assertAlmostEqual(wrapper_timeouts[0][1], 1.8)
         self.assertAlmostEqual(wrapper_timeouts[1][1], 2.25)
+
+    def test_capital_flow_lock_timeout_never_calls_tushare_after_return(self) -> None:
+        late_call = Event()
+        call_count = {"value": 0}
+        tushare = _TushareCapabilityFetcher(capital_flow={})
+
+        def preferred_capital_flow(_stock_code, _timeout_seconds, top_n=5):
+            call_count["value"] += 1
+            late_call.set()
+            return {
+                "status": "not_supported",
+                "stock_flow": {},
+                "sector_rankings": {"top": [], "bottom": []},
+                "source_chain": [],
+                "errors": [],
+            }
+
+        tushare.get_capital_flow = preferred_capital_flow
+        manager = DataFetcherManager(fetchers=[tushare])
+        fetcher_lock = manager._get_fetcher_call_lock(tushare)
+        lock_held = Event()
+        release_lock = Event()
+        wrapper_timeouts = []
+        real_run_with_timeout = manager._run_with_timeout
+
+        def hold_preferred_lock() -> None:
+            with fetcher_lock:
+                lock_held.set()
+                release_lock.wait(timeout=2.0)
+
+        def record_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            return real_run_with_timeout(
+                task,
+                timeout_seconds,
+                task_name,
+                absolute_deadline=absolute_deadline,
+            )
+
+        fallback_payload = {
+            "status": "partial",
+            "stock_flow": {"main_net_inflow": 1.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["capital_stock:akshare"],
+            "errors": [],
+        }
+        holder = Thread(target=hold_preferred_lock, daemon=True)
+        holder.start()
+        self.assertTrue(lock_held.wait(timeout=1.0))
+
+        try:
+            cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=0.25, fundamental_retry_max=1)
+            with patch("src.config.get_config", return_value=cfg), \
+                    patch.object(manager, "_run_with_timeout", side_effect=record_timeout), \
+                    patch.object(
+                        manager._fundamental_adapter,
+                        "get_capital_flow",
+                        return_value=fallback_payload,
+                ):
+                payload, _ = manager._get_ordered_capital_flow("600519", 0.25)
+            calls_at_return = call_count["value"]
+        finally:
+            release_lock.set()
+            holder.join(timeout=1.0)
+
+        called_after_release = late_call.wait(timeout=0.2)
+        providers = [item["provider"] for item in payload["source_chain"]]
+        fallback_timeouts = [
+            timeout
+            for task_name, timeout in wrapper_timeouts
+            if task_name == "akshare_capital_flow"
+        ]
+        self.assertEqual(calls_at_return, 0)
+        self.assertFalse(called_after_release)
+        self.assertEqual(call_count["value"], 0)
+        self.assertNotIn("tushare_capital_flow", providers)
+        self.assertIn("capital_stock:akshare", providers)
+        self.assertTrue(any("timeout" in error for error in payload["errors"]))
+        self.assertEqual(len(fallback_timeouts), 1)
+        self.assertGreater(fallback_timeouts[0], 0.0)
+        self.assertLess(fallback_timeouts[0], 0.25)
+
+    def test_capital_flow_recomputes_tushare_timeout_after_lock_acquisition(self) -> None:
+        preferred_payload = {
+            "status": "partial",
+            "stock_flow": {
+                "net_mf_amount": 1.0,
+                "net_mf_amount_5d": 2.0,
+                "net_mf_amount_10d": 3.0,
+                "main_net_inflow": 4.0,
+                "inflow_5d": 5.0,
+                "inflow_10d": 6.0,
+            },
+            "sector_rankings": {"top": [{"name": "半导体"}], "bottom": []},
+            "source_chain": ["tushare.moneyflow"],
+            "errors": [],
+        }
+        tushare = _TushareCapabilityFetcher(capital_flow=preferred_payload)
+        manager = DataFetcherManager(fetchers=[tushare])
+        fetcher_lock = manager._get_fetcher_call_lock(tushare)
+        lock_held = Event()
+        release_lock = Event()
+        call_started = Event()
+        wrapper_timeouts = []
+        real_run_with_timeout = manager._run_with_timeout
+
+        def hold_preferred_lock() -> None:
+            with fetcher_lock:
+                lock_held.set()
+                release_lock.wait(timeout=2.0)
+
+        def release_after_wait() -> None:
+            if call_started.wait(timeout=1.0):
+                time.sleep(0.1)
+            release_lock.set()
+
+        def record_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            return real_run_with_timeout(
+                task,
+                timeout_seconds,
+                task_name,
+                absolute_deadline=absolute_deadline,
+            )
+
+        holder = Thread(target=hold_preferred_lock, daemon=True)
+        releaser = Thread(target=release_after_wait, daemon=True)
+        holder.start()
+        self.assertTrue(lock_held.wait(timeout=1.0))
+        releaser.start()
+        try:
+            call_started.set()
+            cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=1.0, fundamental_retry_max=1)
+            with patch("src.config.get_config", return_value=cfg), \
+                    patch.object(manager, "_run_with_timeout", side_effect=record_timeout), \
+                    patch.object(manager._fundamental_adapter, "get_capital_flow") as ak_call:
+                payload, _ = manager._get_ordered_capital_flow("600519", 1.0)
+        finally:
+            release_lock.set()
+            holder.join(timeout=1.0)
+            releaser.join(timeout=1.0)
+
+        preferred_timeout = next(
+            timeout
+            for task_name, timeout in wrapper_timeouts
+            if task_name == "tushare_capital_flow"
+        )
+        injected_timeout = tushare.capital_flow_timeouts[0][0]
+        self.assertEqual(payload["stock_flow"]["net_mf_amount"], 1.0)
+        self.assertGreater(injected_timeout, 0.0)
+        self.assertLess(injected_timeout, preferred_timeout - 0.05)
+        ak_call.assert_not_called()
 
     def test_capability_lookup_time_reduces_preferred_adapter_deadline_remainder(self) -> None:
         clock = {"now": 15.0}
