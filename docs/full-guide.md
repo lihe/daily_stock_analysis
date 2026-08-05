@@ -161,6 +161,8 @@ daily_stock_analysis/
 | `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json）；留空时默认自动发现公共实例 | 可选 |
 | `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 是否在 `SEARXNG_BASE_URLS` 为空时自动从 `searx.space` 获取公共实例（默认 `true`） | 可选 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
+| `TUSHARE_API_URL` | 内置 Tushare HTTP client 使用的 Pro 兼容接口地址；建议放在 Repository Variables | 可选 |
+| `TUSHARE_BYPASS_PROXY` | 是否仅让内置 Tushare HTTP client 绕过系统代理；建议放在 Repository Variables | 可选 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | [Longbridge OpenAPI](https://open.longbridge.com/) OAuth client_id；留空且无 Legacy Access Token 时会兼容使用 `LONGBRIDGE_APP_KEY` | 可选 |
 | `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | OAuth token 缓存文件的 base64 内容，供 GitHub Actions / Docker 等 headless 环境恢复 SDK token 缓存 | 可选 |
 | `LONGBRIDGE_APP_KEY` | Longbridge Legacy App Key；无 `LONGBRIDGE_ACCESS_TOKEN` 时也可作为 OAuth client_id 兼容别名 | 可选 |
@@ -183,6 +185,7 @@ daily_stock_analysis/
 
 > 补充说明
 - TUSHARE_TOKEN，当此参数配置后，但不具备港股日线接口权限时，也会出现港股数据查询不出来或者错误的情况，和老版本提示不支持港股效果相同
+- 使用 Tushare Pro 兼容服务时，将 `TUSHARE_TOKEN` 保存为 GitHub Secret，将 `TUSHARE_API_URL` 和 `TUSHARE_BYPASS_PROXY` 保存为 Repository Variables。`TUSHARE_BYPASS_PROXY=true` 只关闭 Tushare 专用 Session 对系统代理的继承，不会修改全局 `NO_PROXY`，也不会影响模型、搜索、通知及其他数据源。
 
 #### ✅ 最小配置示例
 
@@ -380,6 +383,8 @@ daily_stock_analysis/
 | 变量名 | 说明 | 默认值 | 必填 |
 |--------|------|--------|:----:|
 | `TUSHARE_TOKEN` | Tushare Pro Token | - | 可选 |
+| `TUSHARE_API_URL` | 内置 Tushare HTTP client 使用的 Pro 兼容接口地址 | `http://api.tushare.pro` | 可选 |
+| `TUSHARE_BYPASS_PROXY` | 仅让内置 Tushare HTTP client 绕过系统代理，不修改全局代理环境 | `false` | 可选 |
 | `HHXG_DATA_API_TOKEN` | HHXG Data API Token；与 MCP Token 独立，仅用于 A 股辅助上下文 | - | 可选 |
 | `HHXG_DATA_API_BASE_URL` | HHXG Data API 根地址 | `https://hhxg.top/api/data` | 可选 |
 | `HHXG_DATA_API_TIMEOUT_SECONDS` | 单个 HHXG scope 请求超时秒数 | `15` | 可选 |
@@ -1177,6 +1182,8 @@ PUSHOVER_API_TOKEN=your_api_token
 - 需要注册获取 Token
 - 更稳定，数据更全
 - 设置 `TUSHARE_TOKEN`
+- 兼容服务可同时设置 `TUSHARE_API_URL`；如需直连，再设置 `TUSHARE_BYPASS_PROXY=true`
+- 代理绕过仅作用于内置 Tushare HTTP client，不会覆盖进程级 `NO_PROXY`
 
 ### Baostock
 - 免费，无需配置

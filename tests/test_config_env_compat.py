@@ -16,6 +16,37 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_load_from_env_reads_tushare_compatible_endpoint(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "TUSHARE_TOKEN": "demo-token",
+                "TUSHARE_API_URL": "https://tushare.example.test/",
+                "TUSHARE_BYPASS_PROXY": "true",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.tushare_api_url, "https://tushare.example.test")
+        self.assertTrue(config.tushare_bypass_proxy)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_load_from_env_keeps_official_tushare_defaults(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(os.environ, {"STOCK_LIST": "600519"}, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.tushare_api_url, "http://api.tushare.pro")
+        self.assertFalse(config.tushare_bypass_proxy)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_load_from_env_reads_tickflow_api_key(
         self, _mock_parse_litellm_yaml, _mock_setup_env
     ):

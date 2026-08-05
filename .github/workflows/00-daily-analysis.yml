@@ -251,6 +251,9 @@ jobs:
           # 数据源
           # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          TUSHARE_API_URL: ${{ vars.TUSHARE_API_URL || 'http://api.tushare.pro' }}
+          # 仅作用于内置 Tushare HTTP client，不修改其他数据源、LLM 或通知的代理行为。
+          TUSHARE_BYPASS_PROXY: ${{ vars.TUSHARE_BYPASS_PROXY || 'false' }}
           # HHXG Data API 与 MCP token 独立；每轮股票分析统一拉取 23 个 scope 后共享缓存。
           HHXG_DATA_API_TOKEN: ${{ secrets.HHXG_DATA_API_TOKEN }}
           HHXG_DATA_API_BASE_URL: ${{ vars.HHXG_DATA_API_BASE_URL || 'https://hhxg.top/api/data' }}

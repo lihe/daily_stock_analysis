@@ -393,6 +393,8 @@ Add these Secrets:
 | `BRAVE_API_KEYS` | Brave Search API Key | Optional |
 | `MINIMAX_API_KEYS` | MiniMax Coding Plan Web Search | Optional |
 | `TUSHARE_TOKEN` | Tushare Token | Optional |
+| `TUSHARE_API_URL` | Tushare Pro-compatible endpoint (Repository Variable) | Optional |
+| `TUSHARE_BYPASS_PROXY` | Bypass system proxies only for Tushare requests (Repository Variable) | Optional |
 | `GEMINI_MODEL` | Model name (default gemini-2.0-flash) | Optional |
 
 > *Note: Configure at least one notification channel, multiple channels supported for simultaneous push

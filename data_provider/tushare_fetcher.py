@@ -33,7 +33,7 @@ from tenacity import (
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, _is_hk_market
 from .realtime_types import UnifiedRealtimeQuote, ChipDistribution
-from src.config import get_config
+from src.config import DEFAULT_TUSHARE_API_URL, get_config
 import os
 from zoneinfo import ZoneInfo
 
@@ -75,10 +75,22 @@ def _is_us_code(stock_code: str) -> bool:
 class _TushareHttpClient:
     """Lightweight Tushare Pro client that does not require the tushare SDK."""
 
-    def __init__(self, token: str, timeout: int = 30, api_url: str = "http://api.tushare.pro") -> None:
+    def __init__(
+        self,
+        token: str,
+        timeout: int = 30,
+        api_url: str = DEFAULT_TUSHARE_API_URL,
+        bypass_proxy: bool = False,
+    ) -> None:
         self._token = token
         self._timeout = timeout
-        self._api_url = api_url
+        self._api_url = api_url or DEFAULT_TUSHARE_API_URL
+        self._request_client = requests
+        if bypass_proxy:
+            # 只让 Tushare 请求忽略系统代理，避免影响新闻、模型和通知等其他网络链路。
+            session = requests.Session()
+            session.trust_env = False
+            self._request_client = session
 
     def query(self, api_name: str, fields: str = "", **kwargs) -> pd.DataFrame:
         req_params = {
@@ -87,7 +99,7 @@ class _TushareHttpClient:
             "params": kwargs,
             "fields": fields,
         }
-        res = requests.post(self._api_url, json=req_params, timeout=self._timeout)
+        res = self._request_client.post(self._api_url, json=req_params, timeout=self._timeout)
         if res.status_code != 200:
             raise Exception(f"Tushare API HTTP {res.status_code}")
 
@@ -165,20 +177,34 @@ class TushareFetcher(BaseFetcher):
             return
 
         try:
-            self._api = self._build_api_client(config.tushare_token)
+            self._api = self._build_api_client(
+                config.tushare_token,
+                api_url=getattr(config, "tushare_api_url", DEFAULT_TUSHARE_API_URL),
+                bypass_proxy=bool(getattr(config, "tushare_bypass_proxy", False)),
+            )
             logger.info("Tushare API 初始化成功")
         except Exception as e:
             logger.error(f"Tushare API 初始化失败: {e}")
             self._api = None
 
-    def _build_api_client(self, token: str) -> _TushareHttpClient:
+    def _build_api_client(
+        self,
+        token: str,
+        *,
+        api_url: str = DEFAULT_TUSHARE_API_URL,
+        bypass_proxy: bool = False,
+    ) -> _TushareHttpClient:
         """
         Build a lightweight Tushare Pro client over direct HTTP requests.
 
         The project already normalizes all Pro calls through the same request
         contract, so we do not need the official tushare SDK during runtime.
         """
-        client = _TushareHttpClient(token=token)
+        client = _TushareHttpClient(
+            token=token,
+            api_url=api_url,
+            bypass_proxy=bypass_proxy,
+        )
         logger.debug("Tushare API client configured for direct HTTP calls")
         return client
 

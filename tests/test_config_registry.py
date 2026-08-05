@@ -158,6 +158,27 @@ class TestAlphaSiftFieldsRegistered(unittest.TestCase):
         self.assertEqual(field["ui_control"], "password")
 
 
+class TestTushareEndpointFieldsRegistered(unittest.TestCase):
+    def test_tushare_endpoint_is_visible_and_non_sensitive(self):
+        field = get_field_definition("TUSHARE_API_URL")
+
+        self.assertEqual(field["category"], "data_source")
+        self.assertEqual(field["ui_control"], "text")
+        self.assertFalse(field["is_sensitive"])
+        self.assertEqual(field["default_value"], "http://api.tushare.pro")
+        self.assertEqual(field["validation"]["item_type"], "url")
+        self.assertEqual(field["help_key"], "settings.data_source.TUSHARE_API_URL")
+
+    def test_tushare_proxy_bypass_is_an_explicit_switch(self):
+        field = get_field_definition("TUSHARE_BYPASS_PROXY")
+
+        self.assertEqual(field["category"], "data_source")
+        self.assertEqual(field["ui_control"], "switch")
+        self.assertEqual(field["data_type"], "boolean")
+        self.assertEqual(field["default_value"], "false")
+        self.assertEqual(field["help_key"], "settings.data_source.TUSHARE_BYPASS_PROXY")
+
+
 class TestLLMUsageHMACFieldsRegistered(unittest.TestCase):
     def test_secret_is_sensitive_password_field(self):
         field = get_field_definition("LLM_USAGE_HMAC_SECRET")
