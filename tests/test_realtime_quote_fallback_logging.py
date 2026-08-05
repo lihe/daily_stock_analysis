@@ -84,6 +84,7 @@ def _make_pipeline(enable_realtime_quote: bool, realtime_quote=None) -> StockAna
     pipeline.db.get_analysis_context.return_value = {}
     pipeline.search_service = SimpleNamespace(is_available=False)
     pipeline.social_sentiment_service = SimpleNamespace(is_available=False)
+    pipeline.analysis_skills = []
     pipeline.query_source = "system"
     pipeline.trend_analyzer = MagicMock()
     pipeline.analyzer = MagicMock()
@@ -205,6 +206,19 @@ def test_pipeline_warns_once_when_all_realtime_sources_fail(caplog):
         if "历史收盘价继续分析" in record.message
     ]
     assert downgrade_logs == ["贵州茅台(600519) 所有实时行情数据源均不可用，已降级为历史收盘价继续分析"]
+
+
+def test_pipeline_passes_primary_quote_to_fundamental_context():
+    quote = _make_quote(source=RealtimeSource.TENCENT)
+    pipeline = _make_pipeline(enable_realtime_quote=True, realtime_quote=quote)
+
+    pipeline.analyze_stock("600519", ReportType.SIMPLE, "q-reuse")
+
+    pipeline.fetcher_manager.get_fundamental_context.assert_called_once_with(
+        "600519",
+        budget_seconds=1.5,
+        realtime_quote=quote,
+    )
 
 
 @patch("src.config.get_config")

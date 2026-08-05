@@ -530,6 +530,7 @@ class StockAnalysisPipeline:
                         'fundamental_stage_timeout_seconds',
                         FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT,
                     ),
+                    realtime_quote=realtime_quote,
                 )
             except Exception as e:
                 logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
