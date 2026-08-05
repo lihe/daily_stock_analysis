@@ -4,6 +4,7 @@ Tests for structured fundamental context (P0).
 """
 
 import json
+import logging
 import os
 import sys
 import time
@@ -137,13 +138,17 @@ class TestFundamentalContext(unittest.TestCase):
                 self.assertLogs("data_provider.base", level="INFO") as logs:
             context = manager.get_fundamental_context("SH600519", budget_seconds=3.0)
 
-        evidence_lines = [
-            line.split("[DataSourceEvidence] ", 1)[1]
-            for line in logs.output
-            if "[DataSourceEvidence] " in line
+        evidence_records = [
+            record
+            for record in logs.records
+            if record.getMessage().startswith("[DataSourceEvidence] ")
         ]
-        self.assertEqual(len(evidence_lines), 1)
-        evidence = json.loads(evidence_lines[0])
+        self.assertEqual(len(evidence_records), 1)
+        message = evidence_records[0].getMessage()
+        self.assertNotIn("\r", message)
+        self.assertNotIn("\n", message)
+        serialized = message.split("[DataSourceEvidence] ", 1)[1]
+        evidence = json.loads(serialized)
         self.assertEqual(evidence["stock_code"], "600519")
         self.assertEqual(evidence["overall_status"], context["status"])
         self.assertEqual(evidence["coverage"], context["coverage"])
@@ -159,7 +164,6 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(evidence["blocks"]["capital_flow"]["error_types"], ["connection"])
         self.assertEqual(evidence["blocks"]["boards"]["error_types"], ["provider_error"])
 
-        serialized = evidence_lines[0]
         for secret in (
             "SECRET_TOKEN",
             "Token",
@@ -200,20 +204,37 @@ class TestFundamentalContext(unittest.TestCase):
         cache_key = manager._get_fundamental_cache_key("600519", 3.0)
         manager._fundamental_cache[cache_key] = {"ts": time.time(), "context": cached_context}
 
+        original_builder = DataFetcherManager._build_fundamental_source_evidence
+        builder_lock_states = []
+
+        def build_and_record_lock_state(stock_code, context):
+            builder_lock_states.append(manager._fundamental_cache_lock._is_owned())
+            return original_builder(stock_code, context)
+
         with patch("src.config.get_config", return_value=cfg), \
                 patch.object(manager, "get_realtime_quote") as fetch_quote, \
+                patch.object(
+                    DataFetcherManager,
+                    "_build_fundamental_source_evidence",
+                    side_effect=build_and_record_lock_state,
+                ), \
                 self.assertLogs("data_provider.base", level="INFO") as logs:
             context = manager.get_fundamental_context("600519", budget_seconds=3.0)
 
         fetch_quote.assert_not_called()
         self.assertIs(context, cached_context)
-        evidence_lines = [
-            line.split("[DataSourceEvidence] ", 1)[1]
-            for line in logs.output
-            if "[DataSourceEvidence] " in line
+        self.assertEqual(builder_lock_states, [False])
+        evidence_records = [
+            record
+            for record in logs.records
+            if record.getMessage().startswith("[DataSourceEvidence] ")
         ]
-        self.assertEqual(len(evidence_lines), 1)
-        evidence = json.loads(evidence_lines[0])
+        self.assertEqual(len(evidence_records), 1)
+        message = evidence_records[0].getMessage()
+        self.assertNotIn("\r", message)
+        self.assertNotIn("\n", message)
+        serialized = message.split("[DataSourceEvidence] ", 1)[1]
+        evidence = json.loads(serialized)
         self.assertEqual(evidence["stock_code"], "600519")
         self.assertEqual(evidence["overall_status"], "partial")
         self.assertEqual(
@@ -221,9 +242,122 @@ class TestFundamentalContext(unittest.TestCase):
             [{"name": "growth:akshare_financial_analysis", "result": "partial"}],
         )
         self.assertEqual(evidence["blocks"]["growth"]["error_types"], ["provider_error"])
-        serialized = evidence_lines[0]
         for secret in ("CACHE_SECRET", "Token", "https://", "998877", "7654321"):
             self.assertNotIn(secret, serialized)
+
+    def test_failed_cn_context_logs_exactly_one_sanitized_evidence_record(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+
+        with self.assertLogs("data_provider.base", level="INFO") as logs:
+            context = manager.build_failed_fundamental_context(
+                "SH600519\r\n",
+                "RuntimeError:\r\nToken FAILED_SECRET https://private.example/raw response=998877",
+            )
+
+        self.assertEqual(context["status"], "failed")
+        evidence_records = [
+            record
+            for record in logs.records
+            if record.getMessage().startswith("[DataSourceEvidence] ")
+        ]
+        self.assertEqual(len(evidence_records), 1)
+        message = evidence_records[0].getMessage()
+        self.assertNotIn("\r", message)
+        self.assertNotIn("\n", message)
+        evidence = json.loads(message.split("[DataSourceEvidence] ", 1)[1])
+        self.assertEqual(evidence["stock_code"], "600519")
+        self.assertEqual(evidence["overall_status"], "failed")
+        self.assertEqual(evidence["blocks"]["valuation"]["error_types"], ["failed"])
+        for secret in ("FAILED_SECRET", "Token", "https://", "raw response", "998877"):
+            self.assertNotIn(secret, message)
+
+    def test_disabled_cn_context_logs_exactly_one_evidence_record(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = _manager_config()
+        cfg.enable_fundamental_pipeline = False
+
+        with patch("src.config.get_config", return_value=cfg), \
+                self.assertLogs("data_provider.base", level="INFO") as logs:
+            context = manager.get_fundamental_context("600519")
+
+        self.assertEqual(context["status"], "not_supported")
+        evidence_records = [
+            record
+            for record in logs.records
+            if record.getMessage().startswith("[DataSourceEvidence] ")
+        ]
+        self.assertEqual(len(evidence_records), 1)
+        self.assertNotIn("\r", evidence_records[0].getMessage())
+        self.assertNotIn("\n", evidence_records[0].getMessage())
+
+    def test_evidence_serialization_is_deterministic_and_sanitizes_untrusted_inputs(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        context = {
+            "status": "failed",
+            "coverage": {"valuation": "failed"},
+            "valuation": manager._build_fundamental_block(
+                "failed",
+                {},
+                [{
+                    "provider": "provider\r\nToken PROVIDER_SECRET https://private.example/raw",
+                    "result": "failed",
+                    "duration_ms": 1,
+                }],
+                ["TimeoutError:\r\nToken ERROR_SECRET https://private.example/raw response=7654321"],
+            ),
+        }
+
+        with self.assertLogs("data_provider.base", level="INFO") as logs:
+            manager._emit_fundamental_source_evidence(
+                "600519\r\nToken STOCK_SECRET https://private.example/raw",
+                context,
+            )
+            manager._emit_fundamental_source_evidence(
+                "600519\r\nToken STOCK_SECRET https://private.example/raw",
+                context,
+            )
+
+        messages = [
+            record.getMessage()
+            for record in logs.records
+            if record.getMessage().startswith("[DataSourceEvidence] ")
+        ]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0], messages[1])
+        evidence = json.loads(messages[0].split("[DataSourceEvidence] ", 1)[1])
+        self.assertEqual(evidence["stock_code"], "redacted")
+        self.assertEqual(evidence["blocks"]["valuation"]["provider_endpoints"], [])
+        self.assertEqual(evidence["blocks"]["valuation"]["error_types"], ["timeout"])
+        for message in messages:
+            self.assertNotIn("\r", message)
+            self.assertNotIn("\n", message)
+            for secret in (
+                "PROVIDER_SECRET",
+                "ERROR_SECRET",
+                "STOCK_SECRET",
+                "Token",
+                "https://",
+                "raw response",
+                "7654321",
+            ):
+                self.assertNotIn(secret, message)
+
+    def test_evidence_serialization_is_skipped_when_info_logging_is_disabled(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        context = manager.build_failed_fundamental_context("159915", "not logged for ETF")
+        original_builder = DataFetcherManager._build_fundamental_source_evidence
+
+        with patch("data_provider.base.logger.isEnabledFor", return_value=False) as is_enabled, \
+                patch.object(
+                    DataFetcherManager,
+                    "_build_fundamental_source_evidence",
+                    wraps=original_builder,
+                ) as builder:
+            result = manager._emit_fundamental_source_evidence("600519", context)
+
+        self.assertIsNone(result)
+        is_enabled.assert_called_once_with(logging.INFO)
+        builder.assert_not_called()
 
     def test_no_tushare_fetcher_keeps_akshare_bundle_and_capital_flow_routes(self) -> None:
         manager = DataFetcherManager(fetchers=[_DummyFetcher("AkshareFetcher", priority=1)])

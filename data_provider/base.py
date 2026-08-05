@@ -2716,15 +2716,24 @@ class DataFetcherManager:
     @staticmethod
     def _sanitize_provider_endpoint(value: Any) -> Optional[str]:
         """只保留 source_chain 中符合名称形态的来源，拒绝 URL、Token 和自由文本。"""
-        try:
-            name = str(value or "").strip()
-        except Exception:
+        if not isinstance(value, str):
             return None
+        name = value.strip()
         if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,96}", name):
             return None
         if "token" in name.lower():
             return None
         return name
+
+    @staticmethod
+    def _sanitize_evidence_stock_code(value: Any) -> str:
+        """证据日志仅接受规范化六位 A 股代码，其他输入统一脱敏。"""
+        if not isinstance(value, str):
+            return "redacted"
+        normalized = normalize_stock_code(value)
+        if re.fullmatch(r"\d{6}", normalized):
+            return normalized
+        return "redacted"
 
     @staticmethod
     def _classify_evidence_error(value: Any) -> str:
@@ -2821,7 +2830,7 @@ class DataFetcherManager:
             }
 
         return {
-            "stock_code": normalize_stock_code(stock_code),
+            "stock_code": cls._sanitize_evidence_stock_code(stock_code),
             "overall_status": cls._normalize_evidence_status(
                 context.get("status") if isinstance(context, dict) else None
             ),
@@ -2836,11 +2845,13 @@ class DataFetcherManager:
         context: Dict[str, Any],
     ) -> None:
         """以单行稳定 JSON 记录证据；日志失败不得改变基本面返回契约。"""
+        if not logger.isEnabledFor(logging.INFO):
+            return
         try:
             evidence = cls._build_fundamental_source_evidence(stock_code, context)
         except Exception:
             evidence = {
-                "stock_code": normalize_stock_code(stock_code),
+                "stock_code": cls._sanitize_evidence_stock_code(stock_code),
                 "overall_status": "unknown",
                 "coverage": {},
                 "blocks": {},
@@ -3450,7 +3461,7 @@ class DataFetcherManager:
             )
             for block in block_names
         }
-        return {
+        failed_context = {
             "market": market,
             "status": "failed",
             "coverage": {block: "failed" for block in block_names},
@@ -3458,6 +3469,9 @@ class DataFetcherManager:
             "errors": [reason],
             **blocks,
         }
+        if market == "cn" and not _is_etf_code(stock_code):
+            self._emit_fundamental_source_evidence(stock_code, failed_context)
+        return failed_context
 
     def get_fundamental_context(
         self,
@@ -3504,40 +3518,44 @@ class DataFetcherManager:
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
         if cache_ttl > 0:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            cache_hit = False
+            cached_context: Any = None
             with self._fundamental_cache_lock:
                 cache_item = self._fundamental_cache.get(cache_key)
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
                     if age <= cache_ttl:
                         cached_context = cache_item.get("context", {})
-                        if realtime_quote is None or is_etf or not isinstance(cached_context, dict):
-                            if not is_etf:
-                                self._emit_fundamental_source_evidence(stock_code, cached_context)
-                            return cached_context
-                        valuation_payload = {
-                            "pe_ratio": getattr(realtime_quote, "pe_ratio", None),
-                            "pb_ratio": getattr(realtime_quote, "pb_ratio", None),
-                            "total_mv": getattr(realtime_quote, "total_mv", None),
-                            "circ_mv": getattr(realtime_quote, "circ_mv", None),
-                        }
-                        valuation_status = self._infer_block_status(valuation_payload, "partial")
-                        valuation = self._build_fundamental_block(
-                            valuation_status,
-                            valuation_payload,
-                            self._normalize_source_chain(
-                                [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": 0}],
-                                "realtime_quote",
-                                valuation_status,
-                                0,
-                            ),
-                        )
-                        # 只替换本轮估值且复制顶层对象，避免新行情污染跨请求复用的缓存。
-                        reused_context = dict(cached_context)
-                        reused_context["valuation"] = valuation
-                        self._refresh_fundamental_context_metadata(reused_context, is_etf=False)
-                        logger.info("[基本面] %s 缓存命中，估值复用本轮实时行情", stock_code)
-                        self._emit_fundamental_source_evidence(stock_code, reused_context)
-                        return reused_context
+                        cache_hit = True
+            if cache_hit:
+                if realtime_quote is None or is_etf or not isinstance(cached_context, dict):
+                    if not is_etf:
+                        self._emit_fundamental_source_evidence(stock_code, cached_context)
+                    return cached_context
+                valuation_payload = {
+                    "pe_ratio": getattr(realtime_quote, "pe_ratio", None),
+                    "pb_ratio": getattr(realtime_quote, "pb_ratio", None),
+                    "total_mv": getattr(realtime_quote, "total_mv", None),
+                    "circ_mv": getattr(realtime_quote, "circ_mv", None),
+                }
+                valuation_status = self._infer_block_status(valuation_payload, "partial")
+                valuation = self._build_fundamental_block(
+                    valuation_status,
+                    valuation_payload,
+                    self._normalize_source_chain(
+                        [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": 0}],
+                        "realtime_quote",
+                        valuation_status,
+                        0,
+                    ),
+                )
+                # 只替换本轮估值且复制顶层对象，避免新行情污染跨请求复用的缓存。
+                reused_context = dict(cached_context)
+                reused_context["valuation"] = valuation
+                self._refresh_fundamental_context_metadata(reused_context, is_etf=False)
+                logger.info("[基本面] %s 缓存命中，估值复用本轮实时行情", stock_code)
+                self._emit_fundamental_source_evidence(stock_code, reused_context)
+                return reused_context
 
         remaining_seconds = stage_timeout
         result_ctx: Dict[str, Any] = {
