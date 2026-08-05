@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>数据源优先级改造 · PR 验收摘要</title>
+    <style>
+      :root {
+        --paper: #f7f7f5;
+        --paper-edge: #efefea;
+        --ink: #1a1a1a;
+        --ink-soft: #4a4a4a;
+        --ink-faint: #7a7a7a;
+        --rule: #d8d8d2;
+        --rule-soft: #e8e8e2;
+        --accent: #6f9bb8;
+        --accent-soft: #d9e6f0;
+        --accent-faint: #eef4f8;
+        --warn: #b88a4a;
+        --warn-soft: #f5ecdc;
+        --danger: #a05050;
+        --code-bg: #ececea;
+
+        /* Semantic palette for three-layer cards. Rename freely
+           (e.g. --layer-a / --layer-b / --layer-c) when the three
+           layers in the doc are not brain/hands/session. */
+        --brain: #6f9bb8;
+        --brain-bg: #eef4f8;
+        --hands: #b88a4a;
+        --hands-bg: #f5ecdc;
+        --session: #6b7560;
+        --session-bg: #ecede5;
+      }
+
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html { font-size: 16px; }
+
+      /* Font stacks include both English serifs/monospace and CJK
+         fallbacks so the same template renders cleanly for English
+         or Chinese source content. */
+      body {
+        font-family:
+          ui-serif, "Charter", "Iowan Old Style", "Source Serif Pro", Georgia,
+          "Songti SC", "Source Han Serif SC", "Noto Serif CJK SC", serif;
+        background: var(--paper);
+        color: var(--ink);
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        padding: 64px 24px 96px;
+      }
+
+      .doc { max-width: 840px; margin: 0 auto; }
+
+      /* ─── Header ─── */
+      .doc-header {
+        border-bottom: 1px solid var(--rule);
+        padding-bottom: 28px;
+        margin-bottom: 48px;
+      }
+      .doc-eyebrow {
+        font-family:
+          ui-monospace, "SF Mono", Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+        margin-bottom: 14px;
+      }
+      .doc-title {
+        font-family:
+          ui-serif, Charter, Georgia,
+          "Songti SC", "Source Han Serif SC", serif;
+        font-size: 34px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        line-height: 1.2;
+      }
+      .doc-subtitle {
+        font-size: 16px;
+        color: var(--ink-soft);
+        margin-top: 10px;
+        font-style: italic;
+      }
+      .doc-meta {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 11px;
+        color: var(--ink-faint);
+        margin-top: 18px;
+        display: flex;
+        gap: 24px;
+      }
+
+      /* ─── TL;DR ─── */
+      .tldr {
+        background: var(--accent-faint);
+        border-left: 2px solid var(--accent);
+        padding: 20px 24px;
+        margin-bottom: 56px;
+        font-size: 15px;
+      }
+      .tldr-label {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--accent);
+        margin-bottom: 8px;
+        font-weight: 600;
+      }
+
+      /* ─── Sections ─── */
+      section { margin-bottom: 56px; }
+      h2 {
+        font-size: 22px;
+        font-weight: 600;
+        letter-spacing: -0.005em;
+        margin-bottom: 18px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid var(--rule);
+      }
+      h2 .num {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 12px;
+        color: var(--ink-faint);
+        font-weight: 500;
+        margin-right: 14px;
+        letter-spacing: 0.05em;
+      }
+      h3 {
+        font-size: 16px;
+        font-weight: 600;
+        margin: 28px 0 10px;
+      }
+      h4 {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 22px 0 8px;
+      }
+      p { margin-bottom: 14px; }
+      p + p { margin-top: -2px; }
+      a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-soft); }
+      a:hover { border-bottom-color: var(--accent); }
+      code {
+        font-family:
+          ui-monospace, "SF Mono", Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 13px;
+        background: var(--code-bg);
+        padding: 1px 5px;
+        border-radius: 2px;
+      }
+      pre {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 12.5px;
+        line-height: 1.55;
+        background: var(--code-bg);
+        padding: 14px 18px;
+        margin: 14px 0 18px;
+        overflow-x: auto;
+        border-left: 2px solid var(--rule);
+      }
+      pre code { background: transparent; padding: 0; }
+      ul, ol { margin: 8px 0 16px 22px; }
+      li { margin-bottom: 6px; }
+      strong { font-weight: 600; }
+      em { color: var(--ink-soft); }
+      blockquote {
+        border-left: 2px solid var(--rule);
+        padding: 4px 0 4px 18px;
+        margin: 14px 0 18px;
+        color: var(--ink-soft);
+        font-style: italic;
+      }
+
+      /* ─── Tables ─── */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 14px 0 18px;
+        font-size: 14px;
+      }
+      th, td {
+        text-align: left;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--rule-soft);
+        vertical-align: top;
+      }
+      th {
+        font-weight: 600;
+        font-family:
+          ui-sans-serif, system-ui,
+          "PingFang SC", "Hiragino Sans GB", sans-serif;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--ink-faint);
+        border-bottom: 1px solid var(--rule);
+      }
+      tbody tr:hover { background: rgba(0,0,0,0.015); }
+      td.num {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 13px;
+      }
+      td.accent { color: var(--accent); font-weight: 500; }
+
+      /* ─── Callouts ─── */
+      .callout {
+        border: 1px solid var(--rule);
+        background: #fff;
+        padding: 16px 18px;
+        margin: 16px 0 20px;
+      }
+      .callout.warn {
+        border-color: #e6d4a8;
+        background: var(--warn-soft);
+      }
+      .callout.cite {
+        border-left: 2px solid var(--accent);
+        border-top: none; border-right: none; border-bottom: none;
+        background: var(--accent-faint);
+        padding-left: 22px;
+        font-style: italic;
+      }
+      .callout-label {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 10.5px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+        margin-bottom: 8px;
+        font-weight: 600;
+      }
+      .callout.warn .callout-label { color: var(--warn); }
+      .cite-source {
+        font-style: normal;
+        font-size: 12px;
+        color: var(--ink-faint);
+        margin-top: 10px;
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+      }
+
+      /* ─── Figure / Diagram ─── */
+      figure {
+        margin: 28px 0 32px;
+        border: 1px solid var(--rule);
+        background: #fff;
+      }
+      figure svg { display: block; width: 100%; height: auto; }
+      figure img { display: block; width: 100%; height: auto; }
+      figcaption {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+        padding: 10px 16px;
+        border-top: 1px solid var(--rule-soft);
+        background: var(--paper-edge);
+      }
+      figcaption .fig-num {
+        color: var(--accent);
+        margin-right: 10px;
+        font-weight: 600;
+      }
+
+      /* ─── N-column concept cards ─── */
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 14px;
+        margin: 20px 0 18px;
+      }
+      .cards.cols-2 { grid-template-columns: repeat(2, 1fr); }
+      .cards.cols-4 { grid-template-columns: repeat(4, 1fr); }
+      .card {
+        border: 1px solid var(--rule);
+        background: #fff;
+        padding: 16px 16px 14px;
+      }
+      .card-icon {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 11px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+        font-weight: 600;
+        color: var(--accent);
+      }
+      .card-name {
+        font-family:
+          ui-serif, Charter, Georgia,
+          "Songti SC", "Source Han Serif SC", serif;
+        font-size: 17px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      .card-where {
+        font-size: 12px;
+        color: var(--ink-faint);
+        font-style: italic;
+        margin-bottom: 10px;
+      }
+      .card-desc { font-size: 13px; color: var(--ink-soft); line-height: 1.5; }
+
+      /* tone variants for cards */
+      .card.tone-a .card-icon { color: var(--brain); }
+      .card.tone-b .card-icon { color: var(--hands); }
+      .card.tone-c .card-icon { color: var(--session); }
+
+      /* ─── Buttons / Inputs (for interactive sections) ─── */
+      .btn {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 11px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        padding: 8px 14px;
+        background: #fff;
+        color: var(--ink);
+        border: 1px solid var(--rule);
+        cursor: pointer;
+        transition: background 0.15s;
+      }
+      .btn:hover { background: var(--paper-edge); }
+      .btn.primary {
+        background: var(--accent);
+        color: #fff;
+        border-color: var(--accent);
+      }
+      .btn.primary:hover { background: #5a87a4; }
+
+      input[type="text"], input[type="email"], textarea, select {
+        font-family:
+          ui-serif, Charter, Georgia,
+          "Songti SC", "Source Han Serif SC", serif;
+        font-size: 14px;
+        padding: 8px 12px;
+        background: #fff;
+        border: 1px solid var(--rule);
+        color: var(--ink);
+        width: 100%;
+        margin-bottom: 10px;
+      }
+      input:focus, textarea:focus, select:focus {
+        outline: none;
+        border-color: var(--accent);
+      }
+      label {
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      /* ─── Footer ─── */
+      footer {
+        margin-top: 80px;
+        padding-top: 24px;
+        border-top: 1px solid var(--rule);
+        font-size: 12px;
+        color: var(--ink-faint);
+      }
+      footer h4 {
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        font-family:
+          ui-monospace, Menlo,
+          "PingFang SC", "Hiragino Sans GB", monospace;
+        margin-bottom: 10px;
+        color: var(--ink-soft);
+      }
+      footer ul { list-style: none; margin-left: 0; }
+      footer li { margin-bottom: 4px; }
+
+      .mascot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        background: var(--accent);
+        margin-right: 8px;
+        vertical-align: middle;
+      }
+
+      @media (max-width: 720px) {
+        body { padding: 32px 16px 64px; }
+        .doc-title { font-size: 26px; }
+        .cards, .cards.cols-2, .cards.cols-4 { grid-template-columns: 1fr; }
+        .doc-meta { flex-wrap: wrap; gap: 12px; }
+      }
+    </style>
+  </head>
+  <body>
+    <article class="doc">
+
+      <!-- ────── Header ────── -->
+      <header class="doc-header">
+        <div class="doc-eyebrow"><span class="mascot"></span>DAILY STOCK ANALYSIS · ACCEPTANCE</div>
+        <h1 class="doc-title">数据源优先级改造 · PR 验收摘要</h1>
+        <p class="doc-subtitle">实时与结构化数据分流完成；运行时结构化覆盖仍为部分通过</p>
+        <div class="doc-meta">
+          <span>STATUS · PARTIAL ACCEPTANCE</span>
+          <span>DATE · 2026-08-06</span>
+          <span>HEAD · aa6a36c</span>
+        </div>
+      </header>
+
+      <!-- ────── TL;DR ────── -->
+      <div class="tldr">
+        <div class="tldr-label">TL;DR</div>
+        离线合同以 <strong>173 passed</strong> 收口，代码已推送至现有 PR。精确两股 Action
+        <a href="https://github.com/lihe/daily_stock_analysis/actions/runs/31049628869">31049628869</a>
+        成功，且随机延迟被跳过；两股实时均命中 Tencent，日线与筹码均命中 Tushare。
+        结构化基本面/资金流在本次外部运行中出现 timeout，因此最终结论是 <strong>PARTIAL</strong>，不以绿色 workflow 覆盖来源缺口。
+      </div>
+
+      <!-- ────── Sections ────── -->
+      <section>
+        <h2><span class="num">01</span>验收结论</h2>
+        <div class="cards">
+          <div class="card tone-a">
+            <div class="card-icon">GATE 1 · PASS</div>
+            <div class="card-name">Workflow / Job</div>
+            <div class="card-where">→ success / success</div>
+            <div class="card-desc">workflow_dispatch 运行在 aa6a36c；随机延迟 step 为 skipped。</div>
+          </div>
+          <div class="card tone-b">
+            <div class="card-icon">GATE 2 · PARTIAL</div>
+            <div class="card-name">来源决策</div>
+            <div class="card-where">→ 路由正确，结构化超时</div>
+            <div class="card-desc">Tencent 实时、Tushare 日线/筹码均成功；基本面与资金流证据记录 timeout。</div>
+          </div>
+          <div class="card tone-c">
+            <div class="card-icon">GATE 3 · PASS/PARTIAL</div>
+            <div class="card-name">Artifact</div>
+            <div class="card-where">→ 结构完整，覆盖不完整</div>
+            <div class="card-desc">两股报告与两份正式证据存在；600797 交易所监管覆盖为 PARTIAL。</div>
+          </div>
+        </div>
+        <div class="callout warn">
+          <div class="callout-label">VERDICT</div>
+          实现和离线合同通过；目标 Action 与 artifact 结构通过；运行时结构化来源覆盖部分通过。
+          本摘要不把 workflow 的绿色结论解释为所有数据源成功。
+        </div>
+      </section>
+
+      <section>
+        <h2><span class="num">02</span>关键改动</h2>
+        <table>
+          <thead>
+            <tr><th>能力</th><th>最终行为</th><th>保护边界</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>实时行情</strong></td><td>默认 Tencent → Sina → Efinance → Eastmoney</td><td>Token 不再自动注入 Tushare</td></tr>
+            <tr><td><strong>结构化数据</strong></td><td>A 股非 ETF 先 Tushare，再按缺失字段使用 AkShare</td><td>总 deadline 内 fail-open；单位与列表不混合</td></tr>
+            <tr><td><strong>并发与限流</strong></td><td>Tushare 共用四槽信号量、并发安全计数与 deadline-aware 锁</td><td>超时后不产生 late provider call</td></tr>
+            <tr><td><strong>可观测性</strong></td><td>每只 A 股输出脱敏的 DataSourceEvidence</td><td>无 Token、URL、raw response 或完整异常消息</td></tr>
+            <tr><td><strong>Action 输入</strong></td><td>workflow_dispatch 接受可选 stock_codes</td><td>仅覆盖当次手动运行；schedule 行为不变</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2><span class="num">03</span>离线验证</h2>
+        <p>Tasks 1–7 的去重联合集覆盖配置、workflow、实时 fallback、Tushare adapter/fetcher、manager 编排、资金流与 source evidence。</p>
+        <pre><code>173 passed, 6 warnings in 23.58s
+py_compile                         PASS
+flake8 E9,F63,F7,F82               PASS
+git diff --check                   PASS
+broad review e42c9e7..aa6a36c      NO BLOCKER / IMPORTANT</code></pre>
+        <p>6 条 warning 均来自既有第三方依赖的弃用提示；没有测试失败。</p>
+      </section>
+
+      <section>
+        <h2><span class="num">04</span>两股运行时读回</h2>
+        <table>
+          <thead>
+            <tr><th>股票</th><th>实时 / 日线 / 筹码</th><th>结构化 DataSourceEvidence</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="num">600797</td>
+              <td>Tencent / Tushare 42 行 / Tushare</td>
+              <td><code>overall=partial</code>；valuation ok；AkShare bundle timeout；capital-flow 无 provider attempt；dragon-tiger/boards timeout。</td>
+            </tr>
+            <tr>
+              <td class="num">002315</td>
+              <td>Tencent / Tushare 42 行 / Tushare</td>
+              <td><code>overall=partial</code>；valuation 与 AkShare dragon-tiger ok；Tushare bundle timeout；capital-flow Tushare → AkShare 均 timeout。</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>Artifact 读回</h3>
+        <ul>
+          <li><strong>Artifact.</strong> <a href="https://github.com/lihe/daily_stock_analysis/actions/runs/31049628869/artifacts/8948002891">analysis-reports-93</a>，699877 bytes，未过期。</li>
+          <li><strong>报告.</strong> 13877 bytes，且仅包含 002315 与 600797 两个目标股票章节。</li>
+          <li><strong>正式证据.</strong> 002315 为 VERIFIED / 5 events；600797 为 PARTIAL / 4 events，缺口是 sse_regulatory。</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2><span class="num">05</span>残余风险</h2>
+        <ol>
+          <li><strong>结构化端点时延。</strong> 本次 Tushare/AkShare 基本面与资金流没有在 capability deadline 内形成完整覆盖；需要独立复现后再区分权限、空表、网络时延或调度因素。</li>
+          <li><strong>600797 首选尝试缺失。</strong> 证据只确认该股没有记录结构化 Tushare provider；当前日志不足以确认唯一根因。</li>
+          <li><strong>交易所覆盖缺口。</strong> 600797 的 sse_regulatory 不可用；报告已 fail-closed 为不新增仓位，该缺口不能解释为无风险。</li>
+        </ol>
+      </section>
+
+      <!-- ────── Footer ────── -->
+      <footer>
+        <h4>References</h4>
+        <ul>
+          <li>Pull request · <a href="https://github.com/lihe/daily_stock_analysis/pull/1">lihe/daily_stock_analysis#1</a></li>
+          <li>Action run · <a href="https://github.com/lihe/daily_stock_analysis/actions/runs/31049628869">31049628869</a></li>
+          <li>Detailed acceptance · <code>04-acceptance-report.md</code></li>
+        </ul>
+      </footer>
+
+    </article>
+  </body>
+</html>
