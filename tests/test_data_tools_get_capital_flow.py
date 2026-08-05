@@ -6,11 +6,29 @@ Contract tests for get_capital_flow tool output semantics.
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.agent.tools.data_tools import _handle_get_capital_flow
+from data_provider.base import DataFetcherManager
+
+
+class _TushareCapabilityFetcher:
+    name = "TushareFetcher"
+    priority = 2
+
+    def __init__(self, capital_flow):
+        self.capital_flow = capital_flow
+        self.capital_flow_timeouts = []
+
+    def is_available_for_request(self, _capability: str) -> bool:
+        return True
+
+    def get_capital_flow(self, _stock_code: str, timeout_seconds: float, top_n: int = 5):
+        self.capital_flow_timeouts.append((timeout_seconds, top_n))
+        return self.capital_flow
 
 
 class _DummyManagerOk:
@@ -49,6 +67,182 @@ class _DummyManagerRaises:
 
 
 class TestGetCapitalFlowContract(unittest.TestCase):
+
+    def test_tushare_stock_and_sector_fallback_are_independent_and_sector_is_atomic(self) -> None:
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "partial",
+            "stock_flow": {
+                "trade_date": "2026-08-05",
+                "net_mf_amount": 0.0,
+                "net_mf_amount_5d": None,
+                "amount_unit": "万元",
+            },
+            "sector_rankings": {
+                "top": [{"name": "半导体", "net_amount": 5.0, "amount_unit": "亿元"}],
+                "bottom": [],
+            },
+            "source_chain": ["tushare.moneyflow", "tushare.moneyflow_ind_ths"],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        ak_payload = {
+            "status": "partial",
+            "stock_flow": {"main_net_inflow": 9.0, "inflow_5d": 20.0, "inflow_10d": 30.0},
+            "sector_rankings": {
+                "top": [{"name": "白酒", "net_inflow": 99.0}],
+                "bottom": [{"name": "煤炭", "net_inflow": -50.0}],
+            },
+            "source_chain": ["capital_stock:akshare", "capital_sector:akshare"],
+            "errors": [],
+        }
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_payload):
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
+
+        stock_flow = ctx["data"]["stock_flow"]
+        self.assertEqual(stock_flow["net_mf_amount"], 0.0)
+        self.assertEqual(stock_flow["main_net_inflow"], 9.0)
+        self.assertEqual(stock_flow["inflow_5d"], 20.0)
+        self.assertEqual(ctx["data"]["sector_rankings"], {
+            "top": [{"name": "半导体", "net_amount": 5.0, "amount_unit": "亿元"}],
+            "bottom": [],
+        })
+
+    def test_capital_flow_deadline_uses_preferred_slice_and_actual_positive_remainder(self) -> None:
+        clock = {"now": 10.0}
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        wrapper_timeouts = []
+
+        def run_with_timeout(task, timeout_seconds, task_name):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            result = task()
+            # 首选调用和调度共消耗 0.75 秒；fallback 必须拿到 2.25 秒，而不是固定 1.2 秒。
+            if "tushare" in task_name:
+                clock["now"] += 0.75
+            return result, None, 0
+
+        ak_payload = {
+            "status": "partial",
+            "stock_flow": {"main_net_inflow": 1.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["capital_stock:akshare"],
+            "errors": [],
+        }
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(manager, "_run_with_timeout", side_effect=run_with_timeout), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_payload):
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
+
+        self.assertEqual(ctx["data"]["stock_flow"]["main_net_inflow"], 1.0)
+        self.assertAlmostEqual(tushare.capital_flow_timeouts[0][0], 1.8)
+        self.assertAlmostEqual(wrapper_timeouts[0][1], 1.8)
+        self.assertAlmostEqual(wrapper_timeouts[1][1], 2.25)
+
+    def test_capital_flow_slow_preferred_call_reduces_fallback_below_reserved_target(self) -> None:
+        clock = {"now": 30.0}
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "partial",
+            "stock_flow": {"net_mf_amount": 1.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["tushare.moneyflow"],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        wrapper_timeouts = []
+
+        def run_with_timeout(task, timeout_seconds, task_name):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            result = task()
+            if "tushare" in task_name:
+                clock["now"] += 1.9
+            return result, None, 0
+
+        ak_payload = {
+            "status": "partial",
+            "stock_flow": {"main_net_inflow": 2.0},
+            "sector_rankings": {"top": [{"name": "白酒", "net_inflow": 3.0}], "bottom": []},
+            "source_chain": ["capital_sector:akshare"],
+            "errors": [],
+        }
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(manager, "_run_with_timeout", side_effect=run_with_timeout), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_payload):
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
+
+        self.assertEqual(ctx["data"]["sector_rankings"]["top"][0]["name"], "白酒")
+        self.assertAlmostEqual(wrapper_timeouts[1][1], 1.1)
+
+    def test_complete_tushare_stock_flow_can_fill_only_missing_sector_rankings(self) -> None:
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "partial",
+            "stock_flow": {
+                "trade_date": "2026-08-05",
+                "net_mf_amount": 1.0,
+                "net_mf_amount_5d": 2.0,
+                "net_mf_amount_10d": 3.0,
+                "amount_unit": "万元",
+            },
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["tushare.moneyflow"],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        ak_payload = {
+            "status": "partial",
+            "stock_flow": {"main_net_inflow": 99.0},
+            "sector_rankings": {
+                "top": [{"name": "白酒", "net_inflow": 8.0}],
+                "bottom": [{"name": "煤炭", "net_inflow": -2.0}],
+            },
+            "source_chain": ["capital_sector:akshare"],
+            "errors": [],
+        }
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_payload):
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
+
+        self.assertEqual(ctx["data"]["stock_flow"], tushare.capital_flow["stock_flow"])
+        self.assertEqual(ctx["data"]["sector_rankings"], ak_payload["sector_rankings"])
+
+    def test_capital_flow_zero_deadline_remainder_skips_akshare_and_fails_open(self) -> None:
+        clock = {"now": 20.0}
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+
+        def run_with_timeout(task, timeout_seconds, _task_name):
+            result = task()
+            clock["now"] += 3.1
+            return result, None, int(timeout_seconds * 1000)
+
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(manager, "_run_with_timeout", side_effect=run_with_timeout), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow") as ak_call:
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
+
+        self.assertIn(ctx["status"], ("failed", "not_supported", "partial"))
+        self.assertEqual(ctx.get("data", {}).get("stock_flow", {}), {})
+        ak_call.assert_not_called()
 
     def test_ok_response_shape(self) -> None:
         """Happy path: key fields are present and values match the source data."""

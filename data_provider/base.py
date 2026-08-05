@@ -2699,6 +2699,255 @@ class DataFetcherManager:
         return "partial"
 
     @staticmethod
+    def _is_fundamental_missing(value: Any) -> bool:
+        """只识别可安全降级的空值；0、False、日期和非空列表都是有效业务值。"""
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, dict):
+            return not value
+        if isinstance(value, (list, tuple, set)):
+            return not value
+        return DataFetcherManager._try_scalar_isna(value, "fundamental_merge") is True
+
+    @classmethod
+    def _contains_fundamental_missing(cls, value: Any) -> bool:
+        if isinstance(value, dict):
+            return not value or any(cls._contains_fundamental_missing(item) for item in value.values())
+        # 榜单、事件和股东明细必须整体保留；非空列表内不做跨来源逐项拼接。
+        if isinstance(value, (list, tuple, set)):
+            return not value
+        return cls._is_fundamental_missing(value)
+
+    @classmethod
+    def _fill_fundamental_missing(cls, preferred: Any, fallback: Any) -> Any:
+        """递归补空但不覆盖首选来源已经给出的有效字段。"""
+        if isinstance(preferred, dict) and isinstance(fallback, dict):
+            merged = dict(preferred)
+            for key, fallback_value in fallback.items():
+                if key in merged:
+                    merged[key] = cls._fill_fundamental_missing(merged[key], fallback_value)
+                else:
+                    merged[key] = fallback_value
+            return merged
+        if cls._is_fundamental_missing(preferred):
+            return fallback
+        return preferred
+
+    @classmethod
+    def _fundamental_bundle_needs_fallback(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        for block_name in ("growth", "earnings", "institution"):
+            block = payload.get(block_name)
+            if not isinstance(block, dict) or cls._contains_fundamental_missing(block):
+                return True
+        institution = payload.get("institution", {})
+        # Tushare 只提供真实股东快照；变动标量缺席时允许由既有 AkShare 字段补齐。
+        return (
+            "top10_holder_snapshot" in institution
+            and "top10_holder_change" not in institution
+        )
+
+    @staticmethod
+    def _capital_sector_has_rankings(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return bool(payload.get("top")) or bool(payload.get("bottom"))
+
+    @classmethod
+    def _capital_stock_needs_fallback(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict) or not payload:
+            return True
+        preferred_fields = ("net_mf_amount", "net_mf_amount_5d", "net_mf_amount_10d")
+        if any(field in payload for field in preferred_fields):
+            return any(cls._is_fundamental_missing(payload.get(field)) for field in preferred_fields)
+        return cls._contains_fundamental_missing(payload)
+
+    def _get_tushare_capability_fetcher(self, capability: str) -> Optional[BaseFetcher]:
+        """仅查找已配置且当前可用的 Tushare，不改变全局 fetcher 优先级。"""
+        fetcher = self._get_fetcher_by_name("TushareFetcher", capability=capability)
+        if fetcher is None or not callable(getattr(fetcher, capability, None)):
+            return None
+        return fetcher
+
+    def _collect_capability_attempt(
+        self,
+        payload: Any,
+        err: Optional[str],
+        provider: str,
+        duration_ms: int,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        status = str(payload.get("status", "partial")) if isinstance(payload, dict) else "failed"
+        source_chain = self._normalize_source_chain(
+            payload.get("source_chain", []) if isinstance(payload, dict) else None,
+            provider,
+            status,
+            duration_ms,
+        )
+        errors = list(payload.get("errors", [])) if isinstance(payload, dict) else []
+        if err:
+            errors.append(err)
+        return source_chain, errors
+
+    def _get_ordered_fundamental_bundle(
+        self,
+        stock_code: str,
+        timeout_seconds: float,
+    ) -> Tuple[Dict[str, Any], int]:
+        total_budget = max(0.0, float(timeout_seconds))
+        started_at = time.monotonic()
+        # 单个能力共享一个绝对截止时间；线程调度开销也必须计入总预算。
+        deadline = started_at + total_budget
+        preferred_payload: Dict[str, Any] = {}
+        fallback_payload: Dict[str, Any] = {}
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        attempted_statuses: List[str] = []
+
+        tushare = self._get_tushare_capability_fetcher("get_fundamental_bundle")
+        if tushare is not None and total_budget > 0:
+            preferred_budget = min(1.8, total_budget * 0.6)
+            payload, err, cost_ms = self._run_with_retry(
+                lambda: self._call_fetcher_method(
+                    tushare,
+                    "get_fundamental_bundle",
+                    stock_code,
+                    preferred_budget,
+                ),
+                preferred_budget,
+                "tushare_fundamental_bundle",
+            )
+            chain, attempt_errors = self._collect_capability_attempt(
+                payload, err, "tushare_fundamental_bundle", cost_ms
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if isinstance(payload, dict):
+                preferred_payload = payload
+                attempted_statuses.append(str(payload.get("status", "partial")))
+            else:
+                attempted_statuses.append("failed")
+
+        needs_fallback = self._fundamental_bundle_needs_fallback(preferred_payload)
+        fallback_budget = max(0.0, deadline - time.monotonic())
+        if needs_fallback and fallback_budget > 0:
+            payload, err, cost_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                fallback_budget,
+                "akshare_fundamental_bundle",
+            )
+            chain, attempt_errors = self._collect_capability_attempt(
+                payload, err, "akshare_fundamental_bundle", cost_ms
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if isinstance(payload, dict):
+                fallback_payload = payload
+                attempted_statuses.append(str(payload.get("status", "partial")))
+            else:
+                attempted_statuses.append("failed")
+
+        merged = self._fill_fundamental_missing(preferred_payload, fallback_payload)
+        blocks_have_content = any(
+            self._has_meaningful_payload(merged.get(name, {}))
+            for name in ("growth", "earnings", "institution")
+        )
+        if blocks_have_content:
+            status = "partial"
+        elif errors or "failed" in attempted_statuses:
+            status = "failed"
+        else:
+            status = "not_supported"
+        merged.update({"status": status, "source_chain": source_chain, "errors": errors})
+        return merged, int(max(0.0, time.monotonic() - started_at) * 1000)
+
+    def _get_ordered_capital_flow(
+        self,
+        stock_code: str,
+        timeout_seconds: float,
+    ) -> Tuple[Dict[str, Any], int]:
+        total_budget = max(0.0, float(timeout_seconds))
+        started_at = time.monotonic()
+        deadline = started_at + total_budget
+        preferred_payload: Dict[str, Any] = {}
+        fallback_payload: Dict[str, Any] = {}
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        attempted_statuses: List[str] = []
+
+        tushare = self._get_tushare_capability_fetcher("get_capital_flow")
+        if tushare is not None and total_budget > 0:
+            preferred_budget = min(1.8, total_budget * 0.6)
+            payload, err, cost_ms = self._run_with_retry(
+                lambda: self._call_fetcher_method(
+                    tushare,
+                    "get_capital_flow",
+                    stock_code,
+                    preferred_budget,
+                    top_n=5,
+                ),
+                preferred_budget,
+                "tushare_capital_flow",
+            )
+            chain, attempt_errors = self._collect_capability_attempt(
+                payload, err, "tushare_capital_flow", cost_ms
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if isinstance(payload, dict):
+                preferred_payload = payload
+                attempted_statuses.append(str(payload.get("status", "partial")))
+            else:
+                attempted_statuses.append("failed")
+
+        preferred_stock = preferred_payload.get("stock_flow", {})
+        preferred_sector = preferred_payload.get("sector_rankings", {})
+        stock_needs_fallback = self._capital_stock_needs_fallback(preferred_stock)
+        sector_needs_fallback = not self._capital_sector_has_rankings(preferred_sector)
+        fallback_budget = max(0.0, deadline - time.monotonic())
+        if (stock_needs_fallback or sector_needs_fallback) and fallback_budget > 0:
+            payload, err, cost_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+                fallback_budget,
+                "akshare_capital_flow",
+            )
+            chain, attempt_errors = self._collect_capability_attempt(
+                payload, err, "akshare_capital_flow", cost_ms
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if isinstance(payload, dict):
+                fallback_payload = payload
+                attempted_statuses.append(str(payload.get("status", "partial")))
+            else:
+                attempted_statuses.append("failed")
+
+        fallback_stock = fallback_payload.get("stock_flow", {})
+        fallback_sector = fallback_payload.get("sector_rankings", {})
+        stock_flow = (
+            self._fill_fundamental_missing(preferred_stock, fallback_stock)
+            if stock_needs_fallback else preferred_stock
+        )
+        # 两个来源的行业榜单位不同；首选只要有非空榜单，就必须整块保留。
+        sector_rankings = fallback_sector if sector_needs_fallback else preferred_sector
+        has_content = self._has_meaningful_payload(stock_flow) or self._capital_sector_has_rankings(sector_rankings)
+        if has_content:
+            status = "partial"
+        elif errors or "failed" in attempted_statuses:
+            status = "failed"
+        else:
+            status = "not_supported"
+        return {
+            "status": status,
+            "stock_flow": stock_flow if isinstance(stock_flow, dict) else {},
+            "sector_rankings": sector_rankings if isinstance(sector_rankings, dict) else {"top": [], "bottom": []},
+            "source_chain": source_chain,
+            "errors": errors,
+        }, int(max(0.0, time.monotonic() - started_at) * 1000)
+
+    @staticmethod
     def _should_cache_fundamental_context(context: Any) -> bool:
         if not isinstance(context, dict):
             return False
@@ -3116,7 +3365,7 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
+        # growth / earnings / institution share one capability deadline.
         if remaining_seconds <= 0:
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
@@ -3124,21 +3373,30 @@ class DataFetcherManager:
             bundle_ms = 0
         else:
             bundle_timeout = min(fetch_timeout, remaining_seconds)
-            bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
-                bundle_timeout,
-                "fundamental_bundle",
-            )
-            _consume_budget(bundle_ms)
-            if not isinstance(bundle_payload, dict):
-                bundle_status = "failed"
-                bundle_payload = {}
-                bundle_errors = ["fundamental_bundle failed"]
-                if bundle_err_msg:
-                    bundle_errors.append(bundle_err_msg)
+            if is_etf:
+                # ETF 维持既有 AkShare 路径，避免把股票专用 Tushare 端点引入基金路由。
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "fundamental_bundle",
+                )
+                if not isinstance(bundle_payload, dict):
+                    bundle_payload = {
+                        "status": "failed",
+                        "growth": {},
+                        "earnings": {},
+                        "institution": {},
+                        "source_chain": [],
+                        "errors": [bundle_err_msg or "fundamental_bundle failed"],
+                    }
             else:
-                bundle_status = str(bundle_payload.get("status", "not_supported"))
-                bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+                bundle_payload, bundle_ms = self._get_ordered_fundamental_bundle(
+                    stock_code,
+                    bundle_timeout,
+                )
+            _consume_budget(bundle_ms)
+            bundle_status = str(bundle_payload.get("status", "not_supported"))
+            bundle_errors = []
 
         bundle_chain = self._normalize_source_chain(
             bundle_payload.get("source_chain", []),
@@ -3308,18 +3566,8 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
-        payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
-            timeout,
-            "capital_flow",
-        )
-        if not isinstance(payload, dict):
-            return self._build_fundamental_block(
-                "failed",
-                {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "capital_flow failed"],
-            )
+        payload, cost_ms = self._get_ordered_capital_flow(stock_code, timeout)
+        err = None
 
         stock_flow = payload.get("stock_flow") or {}
         sector_rankings = payload.get("sector_rankings") or {}

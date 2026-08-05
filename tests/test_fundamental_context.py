@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import unittest
+from datetime import datetime
 from threading import BoundedSemaphore, Event
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,7 +39,258 @@ class _DummyBoardFetcher:
         return self._boards
 
 
+class _TushareCapabilityFetcher:
+    name = "TushareFetcher"
+    priority = 2
+
+    def __init__(self, bundle=None, capital_flow=None, available: bool = True):
+        self.bundle = bundle
+        self.capital_flow = capital_flow
+        self.available = available
+        self.bundle_timeouts = []
+        self.capital_flow_timeouts = []
+
+    def is_available_for_request(self, _capability: str) -> bool:
+        return self.available
+
+    def get_fundamental_bundle(self, _stock_code: str, timeout_seconds: float):
+        self.bundle_timeouts.append(timeout_seconds)
+        if isinstance(self.bundle, Exception):
+            raise self.bundle
+        return self.bundle
+
+    def get_capital_flow(self, _stock_code: str, timeout_seconds: float, top_n: int = 5):
+        self.capital_flow_timeouts.append((timeout_seconds, top_n))
+        if isinstance(self.capital_flow, Exception):
+            raise self.capital_flow
+        return self.capital_flow
+
+
+def _manager_config(timeout: float = 3.0):
+    return SimpleNamespace(
+        enable_fundamental_pipeline=True,
+        fundamental_cache_ttl_seconds=0,
+        fundamental_cache_max_entries=0,
+        fundamental_stage_timeout_seconds=timeout,
+        fundamental_fetch_timeout_seconds=timeout,
+        fundamental_retry_max=1,
+    )
+
+
+def _empty_bundle():
+    return {
+        "status": "not_supported",
+        "growth": {},
+        "earnings": {},
+        "institution": {},
+        "source_chain": [],
+        "errors": [],
+    }
+
+
 class TestFundamentalContext(unittest.TestCase):
+    def test_no_tushare_fetcher_keeps_akshare_bundle_and_capital_flow_routes(self) -> None:
+        manager = DataFetcherManager(fetchers=[_DummyFetcher("AkshareFetcher", priority=1)])
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        ak_bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 8.0},
+            "earnings": {"forecast_summary": "预增"},
+            "institution": {"top10_holder_change": 1.0},
+            "source_chain": ["growth:akshare"],
+            "errors": [],
+        }
+        ak_capital = {
+            "status": "partial",
+            "stock_flow": {"main_net_inflow": 3.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["capital_stock:akshare"],
+            "errors": [],
+        }
+        with patch("src.config.get_config", return_value=_manager_config()), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle", return_value=ak_bundle) as ak_bundle_call, \
+                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_capital) as ak_flow_call, \
+                patch.object(manager._fundamental_adapter, "get_dragon_tiger_flag", return_value={
+                    "status": "not_supported", "source_chain": [], "errors": []
+                }) as dragon_call, \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=3.0)
+
+        self.assertEqual(ctx["growth"]["data"]["revenue_yoy"], 8.0)
+        self.assertEqual(ctx["capital_flow"]["data"]["stock_flow"]["main_net_inflow"], 3.0)
+        ak_bundle_call.assert_called_once_with("600519")
+        ak_flow_call.assert_called_once_with("600519")
+        dragon_call.assert_called_once_with("600519")
+
+    def test_complete_tushare_bundle_suppresses_akshare(self) -> None:
+        tushare = _TushareCapabilityFetcher(bundle={
+            "status": "partial",
+            "growth": {"revenue_yoy": 0.0, "profitable": False},
+            "earnings": {"financial_report": {"report_date": "2026-06-30", "revenue": 1.0}},
+            "institution": {
+                "top10_holder_snapshot": {"holders": [{"holder_name": "股东甲"}]},
+                "top10_holder_change": 0.0,
+            },
+            "source_chain": ["tushare.fina_indicator"],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        with patch("src.config.get_config", return_value=_manager_config()), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle") as ak_bundle_call, \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=3.0)
+
+        self.assertEqual(ctx["growth"]["data"], {"revenue_yoy": 0.0, "profitable": False})
+        self.assertEqual(ctx["institution"]["data"]["top10_holder_snapshot"]["holders"][0]["holder_name"], "股东甲")
+        ak_bundle_call.assert_not_called()
+
+    def test_partial_tushare_bundle_recursively_fills_only_missing_values(self) -> None:
+        report_date = datetime(2026, 6, 30).date()
+        tushare = _TushareCapabilityFetcher(bundle={
+            "status": "partial",
+            "growth": {
+                "revenue_yoy": 0.0,
+                "profitable": False,
+                "report_date": report_date,
+                "labels": ["累计"],
+                "empty_labels": [],
+                "net_profit_yoy": None,
+            },
+            "earnings": {"financial_report": {"revenue": None}},
+            "institution": {
+                "top10_holder_snapshot": {"holders": [{"holder_name": "股东甲"}]},
+                "top10_holder_change": None,
+            },
+            "source_chain": ["tushare.fina_indicator", "tushare.top10_holders"],
+            "errors": ["income:TimeoutError"],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        ak_bundle = {
+            "status": "partial",
+            "growth": {
+                "revenue_yoy": 99.0,
+                "profitable": True,
+                "report_date": "2025-12-31",
+                "labels": ["单季"],
+                "empty_labels": ["由 AkShare 补齐"],
+                "net_profit_yoy": 7.5,
+            },
+            "earnings": {"financial_report": {"revenue": 123.0}},
+            "institution": {
+                "top10_holder_snapshot": {"holders": [{"holder_name": "股东乙"}]},
+                "top10_holder_change": -1.5,
+            },
+            "source_chain": ["growth:akshare", "top10:akshare"],
+            "errors": ["akshare_partial"],
+        }
+        with patch("src.config.get_config", return_value=_manager_config()), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle", return_value=ak_bundle), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=3.0)
+
+        growth = ctx["growth"]["data"]
+        self.assertEqual(growth["revenue_yoy"], 0.0)
+        self.assertIs(growth["profitable"], False)
+        self.assertEqual(growth["report_date"], report_date)
+        self.assertEqual(growth["labels"], ["累计"])
+        self.assertEqual(growth["empty_labels"], ["由 AkShare 补齐"])
+        self.assertEqual(growth["net_profit_yoy"], 7.5)
+        institution = ctx["institution"]["data"]
+        self.assertEqual(institution["top10_holder_snapshot"]["holders"], [{"holder_name": "股东甲"}])
+        self.assertEqual(institution["top10_holder_change"], -1.5)
+        providers = [item["provider"] for item in ctx["growth"]["source_chain"]]
+        self.assertIn("tushare.fina_indicator", providers)
+        self.assertIn("growth:akshare", providers)
+        self.assertIn("income:TimeoutError", ctx["growth"]["errors"])
+        self.assertIn("akshare_partial", ctx["growth"]["errors"])
+
+    def test_empty_or_error_tushare_bundle_falls_back_to_akshare(self) -> None:
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        ak_bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 8.0},
+            "earnings": {},
+            "institution": {},
+            "source_chain": ["growth:akshare"],
+            "errors": [],
+        }
+        for preferred in (_empty_bundle(), RuntimeError("tushare unavailable")):
+            with self.subTest(preferred=type(preferred).__name__):
+                manager = DataFetcherManager(fetchers=[_TushareCapabilityFetcher(bundle=preferred)])
+                with patch("src.config.get_config", return_value=_manager_config()), \
+                        patch.object(manager, "get_realtime_quote", return_value=quote), \
+                        patch.object(manager._fundamental_adapter, "get_fundamental_bundle", return_value=ak_bundle) as ak_call, \
+                        patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                        patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                        patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+                    ctx = manager.get_fundamental_context("600519", budget_seconds=3.0)
+
+                self.assertEqual(ctx["growth"]["data"]["revenue_yoy"], 8.0)
+                ak_call.assert_called_once_with("600519")
+
+    def test_etf_and_offshore_routes_do_not_call_tushare_capabilities(self) -> None:
+        tushare = _TushareCapabilityFetcher(bundle=_empty_bundle())
+        manager = DataFetcherManager(fetchers=[tushare])
+        etf_quote = SimpleNamespace(pe_ratio=None, pb_ratio=None, total_mv=1.0, circ_mv=1.0)
+        offshore_bundle = {
+            "status": "not_supported", "growth": {}, "earnings": {},
+            "belong_boards": [], "source_chain": [], "errors": [],
+        }
+        with patch("src.config.get_config", return_value=_manager_config()), \
+                patch.object(manager, "get_realtime_quote", return_value=etf_quote), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle", return_value=_empty_bundle()), \
+                patch.object(manager._yfinance_fundamental_adapter, "get_fundamental_bundle", return_value=offshore_bundle):
+            manager.get_fundamental_context("159915", realtime_quote=SimpleNamespace(pe_ratio=99.0))
+            manager.get_fundamental_context("AAPL")
+
+        self.assertEqual(tushare.bundle_timeouts, [])
+        self.assertEqual(tushare.capital_flow_timeouts, [])
+
+    def test_fundamental_bundle_uses_same_deadline_for_tushare_and_akshare(self) -> None:
+        clock = {"now": 40.0}
+        tushare = _TushareCapabilityFetcher(bundle=_empty_bundle())
+        manager = DataFetcherManager(fetchers=[tushare])
+        wrapper_timeouts = []
+
+        def run_with_timeout(task, timeout_seconds, task_name):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            result = task()
+            if "tushare" in task_name:
+                clock["now"] += 0.5
+            return result, None, 0
+
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        ak_bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 8.0},
+            "earnings": {},
+            "institution": {},
+            "source_chain": ["growth:akshare"],
+            "errors": [],
+        }
+        with patch("src.config.get_config", return_value=_manager_config()), \
+                patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(manager, "_run_with_timeout", side_effect=run_with_timeout), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle", return_value=ak_bundle), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=3.0, realtime_quote=quote)
+
+        self.assertEqual(ctx["growth"]["data"]["revenue_yoy"], 8.0)
+        self.assertAlmostEqual(tushare.bundle_timeouts[0], 1.8)
+        self.assertAlmostEqual(wrapper_timeouts[0][1], 1.8)
+        self.assertAlmostEqual(wrapper_timeouts[1][1], 2.5)
+
     def test_offshore_market_returns_not_supported_when_adapter_empty(self) -> None:
         """When yfinance adapter has no data, offshore (US/HK) status is not_supported.
 
