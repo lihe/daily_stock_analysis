@@ -2482,6 +2482,7 @@ class DataFetcherManager:
         task: Callable[[], Any],
         timeout_seconds: float,
         task_name: str,
+        absolute_deadline: Optional[float] = None,
     ) -> Tuple[Optional[Any], Optional[str], int]:
         """
         Execute a task in a short-lived thread and enforce a timeout.
@@ -2489,15 +2490,22 @@ class DataFetcherManager:
         Returns:
             (result, error, duration_ms)
         """
-        start = time.time()
+        start = time.monotonic()
         timeout_value = max(0.0, timeout_seconds)
+        if absolute_deadline is not None:
+            timeout_value = min(timeout_value, max(0.0, absolute_deadline - time.monotonic()))
         if timeout_value <= 0:
             return None, f"{task_name} timeout", 0
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
+        completion_holder: Dict[str, float] = {}
 
         if not self._fundamental_timeout_slots.acquire(blocking=False):
-            return None, f"{task_name} timeout worker pool exhausted", int(timeout_value * 1000)
+            return (
+                None,
+                f"{task_name} timeout worker pool exhausted",
+                int(max(0.0, time.monotonic() - start) * 1000),
+            )
 
         def runner() -> None:
             try:
@@ -2505,6 +2513,7 @@ class DataFetcherManager:
             except Exception as exc:
                 error_holder["value"] = exc
             finally:
+                completion_holder["at"] = time.monotonic()
                 try:
                     self._fundamental_timeout_slots.release()
                 except ValueError:
@@ -2512,25 +2521,36 @@ class DataFetcherManager:
 
         worker = Thread(target=runner, daemon=True, name=f"fundamental-{task_name}")
         try:
+            if absolute_deadline is not None and absolute_deadline - time.monotonic() <= 0:
+                self._fundamental_timeout_slots.release()
+                return None, f"{task_name} timeout", int((time.monotonic() - start) * 1000)
             worker.start()
         except Exception as exc:
             try:
                 self._fundamental_timeout_slots.release()
             except ValueError:
                 pass
-            return None, str(exc), int((time.time() - start) * 1000)
-        worker.join(timeout=timeout_value)
+            return None, str(exc), int((time.monotonic() - start) * 1000)
+        join_timeout = timeout_value
+        if absolute_deadline is not None:
+            # 线程调度耗时也属于同一绝对预算，join 不能重新获得完整 timeout。
+            join_timeout = min(join_timeout, max(0.0, absolute_deadline - time.monotonic()))
+        worker.join(timeout=join_timeout)
+        duration_ms = int(max(0.0, time.monotonic() - start) * 1000)
         if worker.is_alive():
-            return None, f"{task_name} timeout", int(timeout_value * 1000)
+            return None, f"{task_name} timeout", duration_ms
+        if absolute_deadline is not None and completion_holder.get("at", float("inf")) > absolute_deadline:
+            return None, f"{task_name} timeout", duration_ms
         if "value" in error_holder:
-            return None, str(error_holder["value"]), int((time.time() - start) * 1000)
-        return result_holder.get("value"), None, int((time.time() - start) * 1000)
+            return None, str(error_holder["value"]), duration_ms
+        return result_holder.get("value"), None, duration_ms
 
     def _run_with_retry(
         self,
         task: Callable[[], Any],
         timeout_seconds: float,
         task_name: str,
+        absolute_deadline: Optional[float] = None,
     ) -> Tuple[Optional[Any], Optional[str], int]:
         """
         Execute a task with bounded budget and best-effort retries.
@@ -2545,11 +2565,30 @@ class DataFetcherManager:
         last_error: Optional[str] = None
 
         for _ in range(attempts):
+            if absolute_deadline is not None:
+                remaining_seconds = min(
+                    remaining_seconds,
+                    max(0.0, absolute_deadline - time.monotonic()),
+                )
             if remaining_seconds <= 0:
                 break
-            result, err, cost_ms = self._run_with_timeout(task, remaining_seconds, task_name)
+            if absolute_deadline is None:
+                # 未传 deadline 的旧调用保持原三参数调用形态，兼容既有替身与扩展。
+                result, err, cost_ms = self._run_with_timeout(task, remaining_seconds, task_name)
+            else:
+                result, err, cost_ms = self._run_with_timeout(
+                    task,
+                    remaining_seconds,
+                    task_name,
+                    absolute_deadline=absolute_deadline,
+                )
             total_cost_ms += cost_ms
             remaining_seconds = max(0.0, remaining_seconds - cost_ms / 1000)
+            if absolute_deadline is not None:
+                remaining_seconds = min(
+                    remaining_seconds,
+                    max(0.0, absolute_deadline - time.monotonic()),
+                )
             if err is None:
                 return result, None, total_cost_ms
             last_error = err
@@ -2770,12 +2809,16 @@ class DataFetcherManager:
             )
         return cls._contains_fundamental_missing(payload)
 
-    def _get_tushare_capability_fetcher(self, capability: str) -> Optional[BaseFetcher]:
-        """仅查找已配置且当前可用的 Tushare，不改变全局 fetcher 优先级。"""
-        fetcher = self._get_fetcher_by_name("TushareFetcher", capability=capability)
-        if fetcher is None or not callable(getattr(fetcher, capability, None)):
-            return None
-        return fetcher
+    def _find_available_tushare_fetcher(self, capability: str) -> Optional[BaseFetcher]:
+        """按稳定优先级扫描可用实例，避免同名 map 折叠覆盖前序 fetcher。"""
+        for fetcher in self._get_fetchers_snapshot():
+            if fetcher.name != "TushareFetcher":
+                continue
+            if not callable(getattr(fetcher, capability, None)):
+                continue
+            if self._call_availability_probe(fetcher, "is_available", capability) is True:
+                return fetcher
+        return None
 
     def _collect_capability_attempt(
         self,
@@ -2798,6 +2841,43 @@ class DataFetcherManager:
             errors.append(err)
         return source_chain, errors
 
+    def _run_ordered_capability_attempt(
+        self,
+        task: Callable[[float], Any],
+        absolute_deadline: float,
+        task_name: str,
+        provider: str,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str], Optional[str]]:
+        """在一个绝对 deadline 内统一执行 retry、attempted 标记与元数据归一。"""
+        attempt_budget = max(0.0, absolute_deadline - time.monotonic())
+        if attempt_budget <= 0:
+            return {}, [], [], None
+
+        attempted = {"value": False}
+
+        def run_provider() -> Any:
+            attempted["value"] = True
+            remaining = max(0.0, absolute_deadline - time.monotonic())
+            if remaining <= 0:
+                raise DataFetchError(f"{task_name} deadline exhausted")
+            return task(remaining)
+
+        payload, err, cost_ms = self._run_with_retry(
+            run_provider,
+            attempt_budget,
+            task_name,
+            absolute_deadline=absolute_deadline,
+        )
+        chain, errors = self._collect_capability_attempt(
+            payload,
+            err,
+            provider,
+            cost_ms,
+            attempted["value"],
+        )
+        status = str(payload.get("status", "partial")) if isinstance(payload, dict) else "failed"
+        return payload if isinstance(payload, dict) else {}, chain, errors, status
+
     def _get_ordered_fundamental_bundle(
         self,
         stock_code: str,
@@ -2806,79 +2886,48 @@ class DataFetcherManager:
         total_budget = max(0.0, float(timeout_seconds))
         started_at = time.monotonic()
         # 单个能力共享一个绝对截止时间；线程调度开销也必须计入总预算。
-        deadline = started_at + total_budget
+        total_deadline = started_at + total_budget
         preferred_payload: Dict[str, Any] = {}
         fallback_payload: Dict[str, Any] = {}
         source_chain: List[Dict[str, Any]] = []
         errors: List[str] = []
         attempted_statuses: List[str] = []
 
-        tushare = self._get_tushare_capability_fetcher("get_fundamental_bundle")
+        tushare = self._find_available_tushare_fetcher("get_fundamental_bundle")
         if tushare is not None and total_budget > 0:
             preferred_budget = min(1.8, total_budget * 0.6)
-            preferred_deadline = time.monotonic() + preferred_budget
-            preferred_attempted = {"value": False}
-
-            def fetch_tushare_bundle() -> Any:
-                preferred_attempted["value"] = True
-                # retry 也只能拿首选 deadline 的实时余量，不能重新获得完整 1.8 秒。
-                adapter_timeout = max(0.0, preferred_deadline - time.monotonic())
-                if adapter_timeout <= 0:
-                    raise DataFetchError("tushare fundamental preferred deadline exhausted")
-                return self._call_fetcher_method(
+            # 首选切片锚定能力开始时刻，lookup 不能把切片向后平移。
+            preferred_deadline = min(total_deadline, started_at + preferred_budget)
+            preferred_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda remaining: self._call_fetcher_method(
                     tushare,
                     "get_fundamental_bundle",
                     stock_code,
-                    adapter_timeout,
-                )
-
-            payload, err, cost_ms = self._run_with_retry(
-                fetch_tushare_bundle,
-                preferred_budget,
+                    remaining,
+                ),
+                preferred_deadline,
                 "tushare_fundamental_bundle",
-            )
-            chain, attempt_errors = self._collect_capability_attempt(
-                payload,
-                err,
                 "tushare_fundamental_bundle",
-                cost_ms,
-                preferred_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
-            if isinstance(payload, dict):
-                preferred_payload = payload
-                attempted_statuses.append(str(payload.get("status", "partial")))
-            else:
-                attempted_statuses.append("failed")
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
 
         needs_fallback = self._fundamental_bundle_needs_fallback(preferred_payload)
-        fallback_budget = max(0.0, deadline - time.monotonic())
-        if needs_fallback and fallback_budget > 0:
-            fallback_attempted = {"value": False}
-
-            def fetch_akshare_bundle() -> Any:
-                fallback_attempted["value"] = True
-                return self._fundamental_adapter.get_fundamental_bundle(stock_code)
-
-            payload, err, cost_ms = self._run_with_retry(
-                fetch_akshare_bundle,
-                fallback_budget,
+        if needs_fallback:
+            fallback_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda _remaining: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                total_deadline,
                 "akshare_fundamental_bundle",
-            )
-            chain, attempt_errors = self._collect_capability_attempt(
-                payload,
-                err,
                 "akshare_fundamental_bundle",
-                cost_ms,
-                fallback_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
-            if isinstance(payload, dict):
-                fallback_payload = payload
-                attempted_statuses.append(str(payload.get("status", "partial")))
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
             else:
+                errors.append("fundamental bundle capability deadline exhausted")
                 attempted_statuses.append("failed")
 
         merged = self._fill_fundamental_missing(preferred_payload, fallback_payload)
@@ -2902,82 +2951,51 @@ class DataFetcherManager:
     ) -> Tuple[Dict[str, Any], int]:
         total_budget = max(0.0, float(timeout_seconds))
         started_at = time.monotonic()
-        deadline = started_at + total_budget
+        total_deadline = started_at + total_budget
         preferred_payload: Dict[str, Any] = {}
         fallback_payload: Dict[str, Any] = {}
         source_chain: List[Dict[str, Any]] = []
         errors: List[str] = []
         attempted_statuses: List[str] = []
 
-        tushare = self._get_tushare_capability_fetcher("get_capital_flow")
+        tushare = self._find_available_tushare_fetcher("get_capital_flow")
         if tushare is not None and total_budget > 0:
             preferred_budget = min(1.8, total_budget * 0.6)
-            preferred_deadline = time.monotonic() + preferred_budget
-            preferred_attempted = {"value": False}
-
-            def fetch_tushare_capital_flow() -> Any:
-                preferred_attempted["value"] = True
-                adapter_timeout = max(0.0, preferred_deadline - time.monotonic())
-                if adapter_timeout <= 0:
-                    raise DataFetchError("tushare capital-flow preferred deadline exhausted")
-                return self._call_fetcher_method(
+            preferred_deadline = min(total_deadline, started_at + preferred_budget)
+            preferred_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda remaining: self._call_fetcher_method(
                     tushare,
                     "get_capital_flow",
                     stock_code,
-                    adapter_timeout,
+                    remaining,
                     top_n=5,
-                )
-
-            payload, err, cost_ms = self._run_with_retry(
-                fetch_tushare_capital_flow,
-                preferred_budget,
+                ),
+                preferred_deadline,
                 "tushare_capital_flow",
-            )
-            chain, attempt_errors = self._collect_capability_attempt(
-                payload,
-                err,
                 "tushare_capital_flow",
-                cost_ms,
-                preferred_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
-            if isinstance(payload, dict):
-                preferred_payload = payload
-                attempted_statuses.append(str(payload.get("status", "partial")))
-            else:
-                attempted_statuses.append("failed")
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
 
         preferred_stock = preferred_payload.get("stock_flow", {})
         preferred_sector = preferred_payload.get("sector_rankings", {})
         stock_needs_fallback = self._capital_stock_needs_fallback(preferred_stock)
         sector_needs_fallback = not self._capital_sector_has_rankings(preferred_sector)
-        fallback_budget = max(0.0, deadline - time.monotonic())
-        if (stock_needs_fallback or sector_needs_fallback) and fallback_budget > 0:
-            fallback_attempted = {"value": False}
-
-            def fetch_akshare_capital_flow() -> Any:
-                fallback_attempted["value"] = True
-                return self._fundamental_adapter.get_capital_flow(stock_code)
-
-            payload, err, cost_ms = self._run_with_retry(
-                fetch_akshare_capital_flow,
-                fallback_budget,
+        if stock_needs_fallback or sector_needs_fallback:
+            fallback_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda _remaining: self._fundamental_adapter.get_capital_flow(stock_code),
+                total_deadline,
                 "akshare_capital_flow",
-            )
-            chain, attempt_errors = self._collect_capability_attempt(
-                payload,
-                err,
                 "akshare_capital_flow",
-                cost_ms,
-                fallback_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
-            if isinstance(payload, dict):
-                fallback_payload = payload
-                attempted_statuses.append(str(payload.get("status", "partial")))
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
             else:
+                errors.append("capital-flow capability deadline exhausted")
                 attempted_statuses.append("failed")
 
         fallback_stock = fallback_payload.get("stock_flow", {})
@@ -3631,7 +3649,10 @@ class DataFetcherManager:
             has_stock_flow = any(v is not None for v in stock_flow.values())
         has_sector_rankings = bool(sector_rankings.get("top")) or bool(sector_rankings.get("bottom"))
         adapter_status = str(payload.get("status", "not_supported"))
-        if has_stock_flow or has_sector_rankings:
+        # ordered provider 全失败时必须保留 failed，不能被空 payload 映射成 partial。
+        if adapter_status == "failed":
+            capital_flow_status = "failed"
+        elif has_stock_flow or has_sector_rankings:
             capital_flow_status = "ok"
         elif adapter_status == "not_supported":
             capital_flow_status = "not_supported"

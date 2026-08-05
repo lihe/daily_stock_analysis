@@ -53,6 +53,9 @@ class _TushareCapabilityFetcher:
     def is_available_for_request(self, _capability: str) -> bool:
         return self.available
 
+    def is_available(self) -> bool:
+        return self.available
+
     def get_fundamental_bundle(self, _stock_code: str, timeout_seconds: float):
         self.bundle_timeouts.append(timeout_seconds)
         if callable(self.bundle):
@@ -263,7 +266,7 @@ class TestFundamentalContext(unittest.TestCase):
         manager = DataFetcherManager(fetchers=[tushare])
         wrapper_timeouts = []
 
-        def run_with_timeout(task, timeout_seconds, task_name):
+        def run_with_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
             wrapper_timeouts.append((task_name, timeout_seconds))
             result = task()
             if "tushare" in task_name:
@@ -315,7 +318,7 @@ class TestFundamentalContext(unittest.TestCase):
         manager = DataFetcherManager(fetchers=[tushare])
         wrapper_timeouts = []
 
-        def run_with_timeout(task, timeout_seconds, task_name):
+        def run_with_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
             wrapper_timeouts.append((task_name, timeout_seconds))
             try:
                 result, err = task(), None
@@ -341,6 +344,97 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertAlmostEqual(tushare.bundle_timeouts[0], 1.8)
         self.assertAlmostEqual(tushare.bundle_timeouts[1], 1.2)
         self.assertAlmostEqual(wrapper_timeouts[1][1], 1.2)
+        ak_call.assert_not_called()
+
+    def test_run_with_timeout_counts_wall_clock_rollback_and_scheduling_against_monotonic_deadline(self) -> None:
+        manager = DataFetcherManager(fetchers=[_DummyFetcher("AkshareFetcher", priority=1)])
+        clock = {"now": 10.0}
+        join_timeouts = []
+
+        class ImmediateThread:
+            def __init__(self, target, daemon, name):
+                self._target = target
+
+            def start(self):
+                clock["now"] += 0.4
+                self._target()
+
+            def join(self, timeout):
+                join_timeouts.append(timeout)
+
+            def is_alive(self):
+                return False
+
+        with patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch("data_provider.base.time.time", side_effect=[100.0, 90.0]), \
+                patch("data_provider.base.Thread", ImmediateThread):
+            result, err, duration_ms = manager._run_with_timeout(
+                lambda: "ok",
+                1.0,
+                "monotonic_deadline",
+                absolute_deadline=11.0,
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertIsNone(err)
+        self.assertEqual(duration_ms, 400)
+        self.assertAlmostEqual(join_timeouts[0], 0.6)
+
+    def test_run_with_timeout_rejects_result_completed_after_deadline_during_thread_start(self) -> None:
+        manager = DataFetcherManager(fetchers=[_DummyFetcher("AkshareFetcher", priority=1)])
+        clock = {"now": 20.0}
+
+        class DelayedStartThread:
+            def __init__(self, target, daemon, name):
+                self._target = target
+
+            def start(self):
+                clock["now"] += 1.1
+                self._target()
+
+            def join(self, timeout):
+                return None
+
+            def is_alive(self):
+                return False
+
+        with patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch("data_provider.base.Thread", DelayedStartThread):
+            result, err, duration_ms = manager._run_with_timeout(
+                lambda: "late result",
+                1.0,
+                "late_start",
+                absolute_deadline=21.0,
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("timeout", err or "")
+        self.assertEqual(duration_ms, 1100)
+
+    def test_duplicate_tushare_names_scan_to_first_available_capability_instance(self) -> None:
+        available = _TushareCapabilityFetcher(bundle={
+            "status": "partial",
+            "growth": {"revenue_yoy": 4.0},
+            "earnings": {"financial_report": {"revenue": 2.0}},
+            "institution": {"top10_holder_change": 0.0},
+            "source_chain": ["tushare.fina_indicator"],
+            "errors": [],
+        })
+        available.priority = 1
+        unavailable = _TushareCapabilityFetcher(bundle=RuntimeError("must not run"), available=False)
+        unavailable.priority = 2
+        manager = DataFetcherManager(fetchers=[available, unavailable])
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        with patch("src.config.get_config", return_value=_manager_config()), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle") as ak_call, \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=3.0, realtime_quote=quote)
+
+        self.assertEqual(ctx["growth"]["data"]["revenue_yoy"], 4.0)
+        self.assertEqual(len(available.bundle_timeouts), 1)
+        self.assertEqual(unavailable.bundle_timeouts, [])
         ak_call.assert_not_called()
 
     def test_offshore_market_returns_not_supported_when_adapter_empty(self) -> None:

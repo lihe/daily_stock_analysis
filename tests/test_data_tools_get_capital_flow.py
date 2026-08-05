@@ -27,6 +27,9 @@ class _TushareCapabilityFetcher:
     def is_available_for_request(self, _capability: str) -> bool:
         return True
 
+    def is_available(self) -> bool:
+        return True
+
     def get_capital_flow(self, _stock_code: str, timeout_seconds: float, top_n: int = 5):
         self.capital_flow_timeouts.append((timeout_seconds, top_n))
         return self.capital_flow
@@ -122,7 +125,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         manager = DataFetcherManager(fetchers=[tushare])
         wrapper_timeouts = []
 
-        def run_with_timeout(task, timeout_seconds, task_name):
+        def run_with_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
             wrapper_timeouts.append((task_name, timeout_seconds))
             result = task()
             # 首选调用和调度共消耗 0.75 秒；fallback 必须拿到 2.25 秒，而不是固定 1.2 秒。
@@ -149,6 +152,41 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertAlmostEqual(wrapper_timeouts[0][1], 1.8)
         self.assertAlmostEqual(wrapper_timeouts[1][1], 2.25)
 
+    def test_capability_lookup_time_reduces_preferred_adapter_deadline_remainder(self) -> None:
+        clock = {"now": 15.0}
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+
+        def find_tushare(_capability):
+            clock["now"] += 0.5
+            return tushare
+
+        def run_with_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
+            return task(), None, 0
+
+        ak_payload = {
+            "status": "partial",
+            "stock_flow": {"main_net_inflow": 1.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["capital_stock:akshare"],
+            "errors": [],
+        }
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(manager, "_find_available_tushare_fetcher", side_effect=find_tushare, create=True), \
+                patch.object(manager, "_run_with_timeout", side_effect=run_with_timeout), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_payload):
+            manager.get_capital_flow_context("600519", budget_seconds=3.0)
+
+        self.assertAlmostEqual(tushare.capital_flow_timeouts[0][0], 1.3)
+
     def test_capital_flow_slow_preferred_call_reduces_fallback_below_reserved_target(self) -> None:
         clock = {"now": 30.0}
         tushare = _TushareCapabilityFetcher(capital_flow={
@@ -161,7 +199,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         manager = DataFetcherManager(fetchers=[tushare])
         wrapper_timeouts = []
 
-        def run_with_timeout(task, timeout_seconds, task_name):
+        def run_with_timeout(task, timeout_seconds, task_name, absolute_deadline=None):
             wrapper_timeouts.append((task_name, timeout_seconds))
             result = task()
             if "tushare" in task_name:
@@ -245,6 +283,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertNotIn("tushare_capital_flow", providers)
         self.assertNotIn("akshare_capital_flow", providers)
         self.assertEqual(tushare.capital_flow_timeouts, [])
+        self.assertEqual(ctx["status"], "failed")
         self.assertTrue(ctx["errors"])
         self.assertTrue(all("worker pool exhausted" in error for error in ctx["errors"]))
 
@@ -265,6 +304,25 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertEqual(ctx["source_chain"], [])
         self.assertEqual(ctx["errors"], ["thread start failed", "thread start failed"])
         self.assertEqual(tushare.capital_flow_timeouts, [])
+        self.assertEqual(ctx["status"], "failed")
+
+    def test_zero_budget_public_capital_flow_fails_without_provider_calls(self) -> None:
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "partial",
+            "stock_flow": {"net_mf_amount": 1.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["tushare.moneyflow"],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow") as ak_call:
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=0.0)
+
+        self.assertEqual(ctx["status"], "failed")
+        self.assertEqual(tushare.capital_flow_timeouts, [])
+        ak_call.assert_not_called()
 
     def test_capital_flow_zero_deadline_remainder_skips_akshare_and_fails_open(self) -> None:
         clock = {"now": 20.0}
@@ -277,7 +335,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         })
         manager = DataFetcherManager(fetchers=[tushare])
 
-        def run_with_timeout(task, timeout_seconds, _task_name):
+        def run_with_timeout(task, timeout_seconds, _task_name, absolute_deadline=None):
             result = task()
             clock["now"] += 3.1
             return result, None, int(timeout_seconds * 1000)
@@ -289,7 +347,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
                 patch.object(manager._fundamental_adapter, "get_capital_flow") as ak_call:
             ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
 
-        self.assertIn(ctx["status"], ("failed", "not_supported", "partial"))
+        self.assertEqual(ctx["status"], "failed")
         self.assertEqual(ctx.get("data", {}).get("stock_flow", {}), {})
         ak_call.assert_not_called()
 
