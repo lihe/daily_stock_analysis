@@ -253,6 +253,51 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertIn("capital_flow", ctx)
         self.assertIn("dragon_tiger", ctx)
 
+    def test_fundamental_context_reuses_provided_realtime_quote(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=0,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            pe_ratio=12.3,
+            pb_ratio=2.1,
+            total_mv=1.0e11,
+            circ_mv=7.0e10,
+            source=SimpleNamespace(value="tencent"),
+        )
+        bundle = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote") as fetch_quote, \
+                patch(
+                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
+                    return_value=bundle,
+                ), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                realtime_quote=quote,
+            )
+
+        fetch_quote.assert_not_called()
+        self.assertEqual(ctx["valuation"]["data"]["pe_ratio"], 12.3)
+        self.assertEqual(ctx["valuation"]["data"]["pb_ratio"], 2.1)
+        self.assertEqual(ctx["valuation"]["data"]["total_mv"], 1.0e11)
+        self.assertEqual(ctx["valuation"]["data"]["circ_mv"], 7.0e10)
+
     def test_fundamental_context_derives_ttm_dividend_yield_from_quote_price(self) -> None:
         manager = DataFetcherManager(fetchers=[])
         cfg = SimpleNamespace(

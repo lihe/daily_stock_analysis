@@ -2951,7 +2951,9 @@ class DataFetcherManager:
     def get_fundamental_context(
         self,
         stock_code: str,
-        budget_seconds: Optional[float] = None
+        budget_seconds: Optional[float] = None,
+        *,
+        realtime_quote: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Aggregate fundamental blocks with fail-open semantics.
@@ -3016,7 +3018,12 @@ class DataFetcherManager:
             remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
 
         valuation_timeout = min(fetch_timeout, remaining_seconds)
-        if valuation_timeout > 0:
+        if realtime_quote is not None:
+            # 同一报告复用同一行情快照，减少重复请求并避免估值与技术面口径漂移。
+            quote_payload, valuation_err, valuation_ms = realtime_quote, None, 0
+            logger.info("[基本面] %s 估值复用本轮实时行情", stock_code)
+        elif valuation_timeout > 0:
+            # None 表示主流程未成功取得行情，必须保留原实时入口的重试机会。
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code),
                 valuation_timeout,
