@@ -248,6 +248,24 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertTrue(ctx["errors"])
         self.assertTrue(all("worker pool exhausted" in error for error in ctx["errors"]))
 
+    def test_worker_start_failure_keeps_scheduling_error_without_provider_metadata(self) -> None:
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "partial",
+            "stock_flow": {"net_mf_amount": 1.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["tushare.moneyflow"],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.base.Thread.start", side_effect=RuntimeError("thread start failed")):
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
+
+        self.assertEqual(ctx["source_chain"], [])
+        self.assertEqual(ctx["errors"], ["thread start failed", "thread start failed"])
+        self.assertEqual(tushare.capital_flow_timeouts, [])
+
     def test_capital_flow_zero_deadline_remainder_skips_akshare_and_fails_open(self) -> None:
         clock = {"now": 20.0}
         tushare = _TushareCapabilityFetcher(capital_flow={

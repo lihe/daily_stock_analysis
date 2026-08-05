@@ -2798,12 +2798,6 @@ class DataFetcherManager:
             errors.append(err)
         return source_chain, errors
 
-    @staticmethod
-    def _capability_task_attempted(payload: Any, err: Optional[str]) -> bool:
-        if payload is not None:
-            return True
-        return "timeout worker pool exhausted" not in str(err or "")
-
     def _get_ordered_fundamental_bundle(
         self,
         stock_code: str,
@@ -2823,8 +2817,10 @@ class DataFetcherManager:
         if tushare is not None and total_budget > 0:
             preferred_budget = min(1.8, total_budget * 0.6)
             preferred_deadline = time.monotonic() + preferred_budget
+            preferred_attempted = {"value": False}
 
             def fetch_tushare_bundle() -> Any:
+                preferred_attempted["value"] = True
                 # retry 也只能拿首选 deadline 的实时余量，不能重新获得完整 1.8 秒。
                 adapter_timeout = max(0.0, preferred_deadline - time.monotonic())
                 if adapter_timeout <= 0:
@@ -2846,7 +2842,7 @@ class DataFetcherManager:
                 err,
                 "tushare_fundamental_bundle",
                 cost_ms,
-                self._capability_task_attempted(payload, err),
+                preferred_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
@@ -2859,8 +2855,14 @@ class DataFetcherManager:
         needs_fallback = self._fundamental_bundle_needs_fallback(preferred_payload)
         fallback_budget = max(0.0, deadline - time.monotonic())
         if needs_fallback and fallback_budget > 0:
+            fallback_attempted = {"value": False}
+
+            def fetch_akshare_bundle() -> Any:
+                fallback_attempted["value"] = True
+                return self._fundamental_adapter.get_fundamental_bundle(stock_code)
+
             payload, err, cost_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                fetch_akshare_bundle,
                 fallback_budget,
                 "akshare_fundamental_bundle",
             )
@@ -2869,7 +2871,7 @@ class DataFetcherManager:
                 err,
                 "akshare_fundamental_bundle",
                 cost_ms,
-                self._capability_task_attempted(payload, err),
+                fallback_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
@@ -2911,8 +2913,10 @@ class DataFetcherManager:
         if tushare is not None and total_budget > 0:
             preferred_budget = min(1.8, total_budget * 0.6)
             preferred_deadline = time.monotonic() + preferred_budget
+            preferred_attempted = {"value": False}
 
             def fetch_tushare_capital_flow() -> Any:
+                preferred_attempted["value"] = True
                 adapter_timeout = max(0.0, preferred_deadline - time.monotonic())
                 if adapter_timeout <= 0:
                     raise DataFetchError("tushare capital-flow preferred deadline exhausted")
@@ -2934,7 +2938,7 @@ class DataFetcherManager:
                 err,
                 "tushare_capital_flow",
                 cost_ms,
-                self._capability_task_attempted(payload, err),
+                preferred_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
@@ -2950,8 +2954,14 @@ class DataFetcherManager:
         sector_needs_fallback = not self._capital_sector_has_rankings(preferred_sector)
         fallback_budget = max(0.0, deadline - time.monotonic())
         if (stock_needs_fallback or sector_needs_fallback) and fallback_budget > 0:
+            fallback_attempted = {"value": False}
+
+            def fetch_akshare_capital_flow() -> Any:
+                fallback_attempted["value"] = True
+                return self._fundamental_adapter.get_capital_flow(stock_code)
+
             payload, err, cost_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+                fetch_akshare_capital_flow,
                 fallback_budget,
                 "akshare_capital_flow",
             )
@@ -2960,7 +2970,7 @@ class DataFetcherManager:
                 err,
                 "akshare_capital_flow",
                 cost_ms,
-                self._capability_task_attempted(payload, err),
+                fallback_attempted["value"],
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
