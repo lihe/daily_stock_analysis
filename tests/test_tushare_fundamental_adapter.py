@@ -68,7 +68,23 @@ def test_structured_capabilities_fail_closed_for_non_cn_or_etf_without_callback(
         assert calls == []
 
 
-def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> None:
+def test_structured_capabilities_route_naked_and_qualified_92_codes_to_bj() -> None:
+    for stock_code in ("920748", "BJ920748", "BJ.920748", "920748.BJ"):
+        calls: list[dict] = []
+
+        def callback(_api_name: str, **kwargs) -> pd.DataFrame:
+            calls.append(kwargs)
+            return pd.DataFrame()
+
+        adapter = TushareFundamentalAdapter(callback)
+
+        adapter.get_fundamental_bundle(stock_code, timeout_seconds=1.0)
+
+        assert calls
+        assert all(kwargs["ts_code"] == "920748.BJ" for kwargs in calls)
+
+
+def test_fundamental_bundle_anchors_standard_indicator_to_consolidated_income() -> None:
     frames = {
         "fina_indicator": pd.DataFrame(
             [
@@ -76,7 +92,6 @@ def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> No
                     "end_date": "20260331",
                     "ann_date": "20260419",
                     "f_ann_date": "20260420",
-                    "report_type": "1",
                     "tr_yoy": 10.0,
                     "netprofit_yoy": 7.0,
                     "roe": 18.0,
@@ -86,22 +101,24 @@ def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> No
                     "end_date": "20260331",
                     "ann_date": "20260421",
                     "f_ann_date": "20260425",
-                    "report_type": 1,
                     "tr_yoy": 12.5,
+                    "or_yoy": 13.5,
+                    "q_gr_yoy": 14.5,
+                    "q_sales_yoy": 999.0,
                     "netprofit_yoy": 8.5,
+                    "q_profit_yoy": 9.5,
+                    "q_netprofit_yoy": 999.0,
                     "roe": 19.0,
                     "grossprofit_margin": 56.0,
                 },
                 {
-                    "end_date": "20260331",
-                    "ann_date": "20260430",
-                    "report_type": 2,
+                    "end_date": "20260630",
+                    "ann_date": "20260730",
                     "tr_yoy": 999.0,
                 },
                 {
                     "end_date": "20260331",
                     "f_ann_date": "20990101",
-                    "report_type": 1,
                     "tr_yoy": 888.0,
                 },
             ]
@@ -123,9 +140,9 @@ def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> No
                     "n_income_attr_p": 30.0,
                 },
                 {
-                    "end_date": "20251231",
-                    "f_ann_date": "20260320",
-                    "report_type": "1",
+                    "end_date": "20260630",
+                    "f_ann_date": "20260731",
+                    "report_type": "2",
                     "total_revenue": 999.0,
                     "n_income_attr_p": 999.0,
                 },
@@ -140,8 +157,8 @@ def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> No
                     "n_cashflow_act": 40.0,
                 },
                 {
-                    "end_date": "20251231",
-                    "ann_date": "20260320",
+                    "end_date": "20260630",
+                    "ann_date": "20260731",
                     "report_type": "1",
                     "n_cashflow_act": 999.0,
                 },
@@ -175,7 +192,7 @@ def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> No
     assert result["status"] == "partial"
 
 
-def test_missing_report_type_and_dividend_status_fail_closed() -> None:
+def test_income_and_cashflow_without_consolidated_report_type_cannot_anchor_indicator() -> None:
     today = date.today().strftime("%Y%m%d")
     frames = {
         "fina_indicator": pd.DataFrame(
@@ -203,54 +220,28 @@ def test_missing_report_type_and_dividend_status_fail_closed() -> None:
 
 
 def test_financial_report_rejects_missing_nan_or_invalid_end_dates() -> None:
-    invalid_anchor_rows = (
-        {"ann_date": "20260420", "report_type": "1", "tr_yoy": 99.0},
-        {"end_date": None, "ann_date": "20260420", "report_type": "1", "tr_yoy": 99.0},
-        {"end_date": "not-a-date", "ann_date": "20260420", "report_type": "1", "tr_yoy": 99.0},
-    )
-    for anchor_row in invalid_anchor_rows:
-        adapter = TushareFundamentalAdapter(
-            lambda api_name, **_: (
-                pd.DataFrame([anchor_row]) if api_name == "fina_indicator" else pd.DataFrame()
-            )
-        )
-
-        result = adapter.get_fundamental_bundle("600519", timeout_seconds=1.0)
-
-        assert result["growth"] == {}
-        assert "financial_report" not in result["earnings"]
-
     indicator = pd.DataFrame(
-        [{"end_date": "20260331", "ann_date": "20260420", "report_type": "1", "roe": 10.0}]
+        [{"end_date": "20260331", "ann_date": "20260420", "roe": 10.0}]
     )
-    invalid_income_frames = (
-        pd.DataFrame([{"ann_date": "20260421", "report_type": "1", "total_revenue": 999.0}]),
-        pd.DataFrame(
-            [{"end_date": None, "ann_date": "20260421", "report_type": "1", "total_revenue": 999.0}]
-        ),
-        pd.DataFrame(
-            [
-                {
-                    "end_date": "not-a-date",
-                    "ann_date": "20260421",
-                    "report_type": "1",
-                    "total_revenue": 999.0,
-                }
-            ]
-        ),
+    invalid_anchor_rows = (
+        {"ann_date": "20260421", "report_type": "1"},
+        {"end_date": None, "ann_date": "20260421", "report_type": "1"},
+        {"end_date": "not-a-date", "ann_date": "20260421", "report_type": "1"},
     )
-    for income in invalid_income_frames:
-        frames = {"fina_indicator": indicator, "income": income}
-        adapter = TushareFundamentalAdapter(
-            lambda api_name, **_: frames.get(api_name, pd.DataFrame())
-        )
+    for endpoint in ("income", "cashflow"):
+        for anchor_row in invalid_anchor_rows:
+            frames = {
+                "fina_indicator": indicator,
+                endpoint: pd.DataFrame([anchor_row]),
+            }
+            adapter = TushareFundamentalAdapter(
+                lambda api_name, **_: frames.get(api_name, pd.DataFrame())
+            )
 
-        report = adapter.get_fundamental_bundle(
-            "600519", timeout_seconds=1.0
-        )["earnings"]["financial_report"]
+            result = adapter.get_fundamental_bundle("600519", timeout_seconds=1.0)
 
-        assert report["report_date"] == "2026-03-31"
-        assert report["revenue"] is None
+            assert result["growth"] == {}
+            assert "financial_report" not in result["earnings"]
 
 
 def test_shanghai_injected_now_controls_visibility_dividend_window_and_top10_snapshot() -> None:
@@ -261,8 +252,16 @@ def test_shanghai_injected_now_controls_visibility_dividend_window_and_top10_sna
                 {
                     "end_date": "20260630",
                     "ann_date": "20260807",
-                    "report_type": "1",
                     "tr_yoy": 12.0,
+                }
+            ]
+        ),
+        "income": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260630",
+                    "ann_date": "20260807",
+                    "report_type": "1",
                 }
             ]
         ),
@@ -318,22 +317,34 @@ def test_shanghai_injected_now_controls_visibility_dividend_window_and_top10_sna
 
 
 def test_growth_uses_single_quarter_fields_only_when_cumulative_fields_are_missing() -> None:
-    indicator = pd.DataFrame(
-        [
-            {
-                "end_date": "20260331",
-                "ann_date": "20260420",
-                "report_type": "1",
-                "tr_yoy": None,
-                "or_yoy": None,
-                "netprofit_yoy": None,
-                "q_sales_yoy": 6.5,
-                "q_profit_yoy": 4.5,
-            }
-        ]
-    )
+    frames = {
+        "fina_indicator": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260331",
+                    "ann_date": "20260420",
+                    "tr_yoy": None,
+                    "or_yoy": None,
+                    "netprofit_yoy": None,
+                    "q_gr_yoy": 6.5,
+                    "q_sales_yoy": 999.0,
+                    "q_profit_yoy": 4.5,
+                    "q_netprofit_yoy": 999.0,
+                }
+            ]
+        ),
+        "income": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260331",
+                    "ann_date": "20260420",
+                    "report_type": "1",
+                }
+            ]
+        ),
+    }
     adapter = TushareFundamentalAdapter(
-        lambda api_name, **_: indicator if api_name == "fina_indicator" else pd.DataFrame()
+        lambda api_name, **_: frames.get(api_name, pd.DataFrame())
     )
 
     result = adapter.get_fundamental_bundle("000001", timeout_seconds=1.0)
@@ -344,6 +355,103 @@ def test_growth_uses_single_quarter_fields_only_when_cumulative_fields_are_missi
     assert result["growth"]["net_profit_yoy_basis"] == "single_quarter"
     assert result["growth"]["roe"] is None
     assert result["growth"]["gross_margin"] is None
+
+
+def test_growth_uses_or_yoy_before_q_gr_yoy_when_tr_yoy_is_missing() -> None:
+    frames = {
+        "fina_indicator": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260331",
+                    "ann_date": "20260420",
+                    "tr_yoy": None,
+                    "or_yoy": 7.5,
+                    "q_gr_yoy": 99.0,
+                }
+            ]
+        ),
+        "income": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260331",
+                    "ann_date": "20260420",
+                    "report_type": "1",
+                }
+            ]
+        ),
+    }
+    adapter = TushareFundamentalAdapter(
+        lambda api_name, **_: frames.get(api_name, pd.DataFrame())
+    )
+
+    result = adapter.get_fundamental_bundle("000001", timeout_seconds=1.0)
+
+    assert result["growth"]["revenue_yoy"] == 7.5
+    assert result["growth"]["revenue_yoy_basis"] == "cumulative"
+
+
+def test_fundamental_bundle_uses_cashflow_anchor_when_consolidated_income_is_absent() -> None:
+    frames = {
+        "fina_indicator": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260331",
+                    "ann_date": "20260420",
+                    "tr_yoy": 3.0,
+                },
+                {
+                    "end_date": "20260630",
+                    "ann_date": "20260720",
+                    "tr_yoy": 6.0,
+                    "roe": 12.0,
+                },
+            ]
+        ),
+        "income": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260630",
+                    "ann_date": "20260721",
+                    "report_type": "2",
+                    "total_revenue": 999.0,
+                }
+            ]
+        ),
+        "cashflow": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260331",
+                    "ann_date": "20260421",
+                    "report_type": "1",
+                    "n_cashflow_act": 30.0,
+                },
+                {
+                    "end_date": "20260630",
+                    "ann_date": "20260722",
+                    "report_type": "1",
+                    "n_cashflow_act": 60.0,
+                },
+            ]
+        ),
+    }
+    adapter = TushareFundamentalAdapter(
+        lambda api_name, **_: frames.get(api_name, pd.DataFrame())
+    )
+
+    result = adapter.get_fundamental_bundle("600519", timeout_seconds=1.0)
+
+    assert result["growth"]["revenue_yoy"] == 6.0
+    assert result["earnings"]["financial_report"] == {
+        "report_date": "2026-06-30",
+        "announcement_date": "2026-07-20",
+        "revenue": None,
+        "net_profit_parent": None,
+        "operating_cash_flow": 60.0,
+        "roe": 12.0,
+        "currency": "CNY",
+        "amount_unit": "yuan",
+        "report_type": 1,
+    }
 
 
 def test_financial_report_keeps_missing_fields_none_and_uses_visible_income_metadata() -> None:
@@ -517,6 +625,7 @@ def test_top10_holders_returns_latest_visible_snapshot_without_manufactured_chan
     assert snapshot["report_date"] == "2026-03-31"
     assert snapshot["announcement_date"] == "2026-04-25"
     assert snapshot["holder_count"] == 2
+    assert snapshot["top10_total_hold_ratio"] == 18.0
     assert snapshot["amount_unit"] == "share"
     assert snapshot["holders"][0] == {
         "holder_name": "股东甲",
@@ -531,74 +640,198 @@ def test_top10_holders_returns_latest_visible_snapshot_without_manufactured_chan
     assert all("hold_change" not in item for item in snapshot["holders"])
 
 
-def test_capital_flow_uses_true_net_mf_amount_names_and_whole_sector_list() -> None:
+def test_capital_flow_uses_completed_open_dates_and_official_moneyflow_fields() -> None:
     moneyflow = pd.DataFrame(
         [
-            {"trade_date": "20260701", "net_mf_amount": 1.0},
-            {"trade_date": "20260711", "net_mf_amount": 11.0},
-            {"trade_date": "20260703", "net_mf_amount": 3.0},
-            {"trade_date": "20260709", "net_mf_amount": 9.0},
-            {"trade_date": "20260705", "net_mf_amount": 5.0},
-            {"trade_date": "20260707", "net_mf_amount": 7.0},
-            {"trade_date": "20260702", "net_mf_amount": 2.0},
-            {"trade_date": "20260710", "net_mf_amount": 10.0},
-            {"trade_date": "20260704", "net_mf_amount": 4.0},
-            {"trade_date": "20260708", "net_mf_amount": 8.0},
-            {"trade_date": "20260706", "net_mf_amount": 6.0},
+            {"trade_date": "20260801", "net_mf_amount": 999.0},
+            {"trade_date": "20260724", "net_mf_amount": 24.0},
+            {"trade_date": "20260803", "net_mf_amount": 3.0},
+            {"trade_date": "20260728", "net_mf_amount": 28.0},
+            {"trade_date": "20260807", "net_mf_amount": 7.0},
+            {"trade_date": "20260730", "net_mf_amount": 30.0},
+            {"trade_date": "20260805", "net_mf_amount": 5.0},
+            {"trade_date": "20260727", "net_mf_amount": 27.0},
+            {"trade_date": "20260804", "net_mf_amount": 4.0},
+            {"trade_date": "20260731", "net_mf_amount": 31.0},
+            {"trade_date": "20260806", "net_mf_amount": 6.0},
+            {"trade_date": "20260729", "net_mf_amount": 29.0},
         ]
     )
     sectors = pd.DataFrame(
         [
-            {"industry": "行业甲", "net_amount": -30000.0},
-            {"industry": "行业乙", "net_amount": 10000.0},
-            {"industry": "行业丙", "net_amount": 50000.0},
-            {"industry": "行业丁", "net_amount": -10000.0},
-            {"industry": "行业戊", "net_amount": 20000.0},
+            {"trade_date": "20260806", "industry": "旧行业", "net_buy_amount": 99.0},
+            {"trade_date": "20260807", "industry": "行业甲", "net_buy_amount": -3.0},
+            {"trade_date": "20260807", "industry": "行业乙", "net_buy_amount": 1.0},
+            {"trade_date": "20260807", "industry": "行业丙", "net_buy_amount": 5.0},
+            {"trade_date": "20260807", "industry": "行业丁", "net_buy_amount": -1.0},
+            {"trade_date": "20260807", "industry": "行业戊", "net_buy_amount": 2.0},
         ]
     )
-    calls: list[str] = []
+    calls: dict[str, dict] = {}
+    resolver_calls: list[str] = []
+    open_dates = [
+        "20260807",
+        "20260806",
+        "20260805",
+        "20260804",
+        "20260803",
+        "20260731",
+        "20260730",
+        "20260729",
+        "20260728",
+        "20260727",
+        "20260724",
+    ]
 
-    def callback(api_name: str, **_) -> pd.DataFrame:
-        calls.append(api_name)
+    def callback(api_name: str, **kwargs) -> pd.DataFrame:
+        calls[api_name] = kwargs
         return moneyflow if api_name == "moneyflow" else sectors
 
-    result = TushareFundamentalAdapter(callback).get_capital_flow(
-        "600519", timeout_seconds=1.0, top_n=2
-    )
+    def resolve_trade_dates(end_date: str) -> list[str]:
+        resolver_calls.append(end_date)
+        return open_dates
 
-    assert set(calls) == {"moneyflow", "moneyflow_ind_ths"}
+    adapter = TushareFundamentalAdapter(
+        callback,
+        now_provider=lambda: datetime(2026, 8, 7, 19, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        trade_date_resolver=resolve_trade_dates,
+    )
+    result = adapter.get_capital_flow("600519", timeout_seconds=1.0, top_n=2)
+
+    assert resolver_calls == ["20260807"]
+    assert calls == {
+        "moneyflow": {
+            "ts_code": "600519.SH",
+            "start_date": "20260727",
+            "end_date": "20260807",
+        },
+        "moneyflow_ind_ths": {"trade_date": "20260807"},
+    }
     assert result["stock_flow"] == {
-        "trade_date": "2026-07-11",
+        "trade_date": "2026-08-07",
         "completed_trade_dates": [
-            "2026-07-11",
-            "2026-07-10",
-            "2026-07-09",
-            "2026-07-08",
-            "2026-07-07",
-            "2026-07-06",
-            "2026-07-05",
-            "2026-07-04",
-            "2026-07-03",
-            "2026-07-02",
+            "2026-08-07",
+            "2026-08-06",
+            "2026-08-05",
+            "2026-08-04",
+            "2026-08-03",
+            "2026-07-31",
+            "2026-07-30",
+            "2026-07-29",
+            "2026-07-28",
+            "2026-07-27",
         ],
-        "net_mf_amount": 11.0,
-        "net_mf_amount_5d": 45.0,
-        "net_mf_amount_10d": 65.0,
+        "net_mf_amount": 7.0,
+        "net_mf_amount_5d": 25.0,
+        "net_mf_amount_10d": 170.0,
+        "net_flow_kind": "net_mf_amount",
         "amount_unit": "万元",
     }
     assert result["sector_rankings"] == {
         "top": [
-            {"name": "行业丙", "net_amount": 5.0, "amount_unit": "亿元"},
-            {"name": "行业戊", "net_amount": 2.0, "amount_unit": "亿元"},
+            {"name": "行业丙", "net_buy_amount": 5.0, "amount_unit": "亿元"},
+            {"name": "行业戊", "net_buy_amount": 2.0, "amount_unit": "亿元"},
         ],
         "bottom": [
-            {"name": "行业甲", "net_amount": -3.0, "amount_unit": "亿元"},
-            {"name": "行业丁", "net_amount": -1.0, "amount_unit": "亿元"},
+            {"name": "行业甲", "net_buy_amount": -3.0, "amount_unit": "亿元"},
+            {"name": "行业丁", "net_buy_amount": -1.0, "amount_unit": "亿元"},
         ],
     }
     assert "main_net_inflow" not in result["stock_flow"]
     assert "inflow_5d" not in result["stock_flow"]
     assert "inflow_10d" not in result["stock_flow"]
+
+
+def test_capital_flow_calendar_window_handles_cutoff_weekend_and_holiday() -> None:
+    scenarios = (
+        (
+            datetime(2026, 8, 7, 18, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+            "20260807",
+            "20260724",
+            "20260806",
+        ),
+        (
+            datetime(2026, 8, 8, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            "20260808",
+            "20260727",
+            "20260807",
+        ),
+        (
+            datetime(2026, 8, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            "20260810",
+            "20260727",
+            "20260807",
+        ),
+    )
+    open_dates = [
+        "20260807",
+        "20260806",
+        "20260805",
+        "20260804",
+        "20260803",
+        "20260731",
+        "20260730",
+        "20260729",
+        "20260728",
+        "20260727",
+        "20260724",
+    ]
+
+    for now, requested_end, expected_start, expected_end in scenarios:
+        calls: dict[str, dict] = {}
+        resolver_calls: list[str] = []
+
+        def callback(api_name: str, **kwargs) -> pd.DataFrame:
+            calls[api_name] = kwargs
+            return pd.DataFrame()
+
+        def resolve_trade_dates(end_date: str) -> list[str]:
+            resolver_calls.append(end_date)
+            return open_dates
+
+        adapter = TushareFundamentalAdapter(
+            callback,
+            now_provider=lambda current=now: current,
+            trade_date_resolver=resolve_trade_dates,
+        )
+
+        adapter.get_capital_flow("600519", timeout_seconds=1.0)
+
+        assert resolver_calls == [requested_end]
+        assert calls["moneyflow"] == {
+            "ts_code": "600519.SH",
+            "start_date": expected_start,
+            "end_date": expected_end,
+        }
+        assert calls["moneyflow_ind_ths"] == {"trade_date": expected_end}
+
+
+def test_capital_flow_default_constructor_excludes_same_day_rows_before_1900() -> None:
+    frames = {
+        "moneyflow": pd.DataFrame(
+            [
+                {"trade_date": "20260807", "net_mf_amount": 99.0},
+                {"trade_date": "20260806", "net_mf_amount": 6.0},
+            ]
+        ),
+        "moneyflow_ind_ths": pd.DataFrame(
+            [
+                {"trade_date": "20260807", "industry": "未完成行业", "net_buy_amount": 99.0},
+                {"trade_date": "20260806", "industry": "已完成行业", "net_buy_amount": 6.0},
+            ]
+        ),
+    }
+    adapter = TushareFundamentalAdapter(
+        lambda api_name, **_: frames[api_name],
+        now_provider=lambda: datetime(2026, 8, 7, 18, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    result = adapter.get_capital_flow("600519", timeout_seconds=1.0, top_n=1)
+
+    assert result["stock_flow"]["trade_date"] == "2026-08-06"
+    assert result["sector_rankings"]["top"] == [
+        {"name": "已完成行业", "net_buy_amount": 6.0, "amount_unit": "亿元"}
+    ]
 
 
 def test_endpoint_error_is_sanitized_while_other_endpoint_data_survives() -> None:
@@ -661,14 +894,18 @@ def test_fundamental_timeout_returns_completed_partial_without_waiting_for_runni
     assert result["earnings"]["forecast_summary"] == "已完成"
     assert set(result["errors"]) == {
         f"{api_name}:TimeoutError"
-        for api_name in {
-            "fina_indicator",
-            "income",
-            "cashflow",
-            "express",
-            "dividend",
-            "top10_holders",
-        }
+        for api_name in started_before_release
+        if api_name != "forecast"
     }
+    assert set(result["source_chain"]) == {
+        f"tushare.{api_name}" for api_name in started_before_release
+    }
+    cancelled_before_start = set(TushareFundamentalAdapter._FUNDAMENTAL_ENDPOINTS) - set(
+        started_before_release
+    )
+    assert all(
+        not any(api_name in item for item in result["errors"] + result["source_chain"])
+        for api_name in cancelled_before_start
+    )
     with lock:
         assert started == started_before_release

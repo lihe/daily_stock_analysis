@@ -160,7 +160,9 @@ class TushareFetcher(BaseFetcher):
         self.date_list: Optional[List[str]] = None  # 交易日列表缓存（倒序，最新日期在前）
         self._date_list_end: Optional[str] = None  # 缓存对应的截止日期，用于跨日刷新
         self._fundamental_adapter = TushareFundamentalAdapter(
-            lambda api_name, **kwargs: self._call_api_with_rate_limit(api_name, **kwargs)
+            lambda api_name, **kwargs: self._call_api_with_rate_limit(api_name, **kwargs),
+            now_provider=lambda: self._get_china_now(),
+            trade_date_resolver=self._get_trade_dates,
         )
 
         # 尝试初始化 API
@@ -341,7 +343,8 @@ class TushareFetcher(BaseFetcher):
         if self.date_list is not None and self._date_list_end == requested_end_date:
             return self.date_list
 
-        start_date = (china_now - timedelta(days=20)).strftime("%Y%m%d")
+        # 长假前后 20 个自然日可能不足 10 个开市日，扩大窗口以满足资金流聚合。
+        start_date = (china_now - timedelta(days=40)).strftime("%Y%m%d")
         df_cal = self._call_api_with_rate_limit(
             "trade_cal",
             exchange="SSE",

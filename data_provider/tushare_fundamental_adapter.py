@@ -13,6 +13,7 @@ import pandas as pd
 
 ApiCallback = Callable[..., pd.DataFrame]
 NowProvider = Callable[[], datetime]
+TradeDateResolver = Callable[[str], List[str]]
 
 _ETF_PREFIXES = ("15", "16", "18", "51", "52", "56", "58")
 _CN_STOCK_EXCHANGES = {
@@ -26,7 +27,9 @@ def _supported_cn_stock(stock_code: str) -> bool:
     """只接受可明确归属交易所的 A 股，未知代码宁可不请求。"""
     raw = str(stock_code).strip().upper()
     exchange_hint: Optional[str] = None
-    if raw.startswith(("SH", "SZ", "BJ")):
+    if raw.startswith(("SH.", "SZ.", "BJ.")):
+        exchange_hint, raw = raw[:2], raw[3:]
+    elif raw.startswith(("SH", "SZ", "BJ")):
         exchange_hint, raw = raw[:2], raw[2:]
     elif "." in raw:
         raw, exchange_hint = raw.split(".", 1)
@@ -71,6 +74,8 @@ def _empty_capital_flow() -> Dict[str, Any]:
 
 def _to_ts_code(stock_code: str) -> str:
     code = str(stock_code).strip().upper()
+    if code.startswith(("SH.", "SZ.", "BJ.")):
+        return f"{code[3:]}.{code[:2]}"
     if "." in code:
         symbol, exchange = code.split(".", 1)
         if exchange == "SS":
@@ -78,7 +83,7 @@ def _to_ts_code(stock_code: str) -> str:
         return f"{symbol}.{exchange}"
     if code.startswith(("SH", "SZ", "BJ")):
         return f"{code[2:]}.{code[:2]}"
-    exchange = "SH" if code.startswith(("5", "6", "9")) else "BJ" if code.startswith(("4", "8")) else "SZ"
+    exchange = "BJ" if code.startswith(("4", "8", "92")) else "SH" if code.startswith(("5", "6")) else "SZ"
     return f"{code}.{exchange}"
 
 
@@ -232,10 +237,12 @@ def _build_top10_snapshot(df: Optional[pd.DataFrame], visible_date: date) -> Dic
                 "holder_type": _safe_str(row.get("holder_type")),
             }
         )
+    ratios = [item["hold_ratio"] for item in holders if item["hold_ratio"] is not None]
     return {
         "report_date": latest_end.date().isoformat(),
         "announcement_date": latest_announcement.date().isoformat(),
         "holder_count": len(holders),
+        "top10_total_hold_ratio": round(sum(ratios), 6) if ratios else None,
         "amount_unit": "share",
         "holders": holders,
     }
@@ -258,11 +265,13 @@ class TushareFundamentalAdapter:
         self,
         api_callback: ApiCallback,
         now_provider: Optional[NowProvider] = None,
+        trade_date_resolver: Optional[TradeDateResolver] = None,
     ) -> None:
         self._api_callback = api_callback
         self._now_provider = now_provider or (
             lambda: datetime.now(ZoneInfo("Asia/Shanghai"))
         )
+        self._trade_date_resolver = trade_date_resolver
 
     def _shanghai_now(self) -> datetime:
         now = self._now_provider()
@@ -295,8 +304,9 @@ class TushareFundamentalAdapter:
             except Exception as exc:
                 errors.append(f"{api_name}:{type(exc).__name__}")
         for future in pending:
-            errors.append(f"{futures[future]}:TimeoutError")
-            future.cancel()
+            # 排队任务若取消成功，callback 从未开始，不能制造 timeout 元数据。
+            if not future.cancel():
+                errors.append(f"{futures[future]}:TimeoutError")
         executor.shutdown(wait=False, cancel_futures=True)
 
         endpoint_order = {api_name: index for index, api_name in enumerate(requests)}
@@ -322,34 +332,45 @@ class TushareFundamentalAdapter:
         result["source_chain"] = [f"tushare.{api_name}" for api_name in attempted]
         result["errors"] = errors
 
-        indicator_row = _select_report_row(
-            frames.get("fina_indicator"),
+        income_anchor = _select_report_row(
+            frames.get("income"),
             visible_date=visible_date,
             require_report_type=True,
             require_end_date=True,
         )
-        if indicator_row is None:
-            income_anchor = _select_report_row(
-                frames.get("income"),
+        cashflow_anchor = None
+        if income_anchor is None:
+            cashflow_anchor = _select_report_row(
+                frames.get("cashflow"),
                 visible_date=visible_date,
                 require_report_type=True,
                 require_end_date=True,
             )
-            target_end_date = _iso_date(income_anchor.get("end_date")) if income_anchor is not None else None
-        else:
-            target_end_date = _iso_date(indicator_row.get("end_date"))
-        income_row = _select_report_row(
-            frames.get("income"),
-            visible_date=visible_date,
-            end_date=target_end_date,
-            require_report_type=True,
+        report_anchor = income_anchor if income_anchor is not None else cashflow_anchor
+        target_end_date = (
+            _iso_date(report_anchor.get("end_date")) if report_anchor is not None else None
         )
-        cashflow_row = _select_report_row(
-            frames.get("cashflow"),
-            visible_date=visible_date,
-            end_date=target_end_date,
-            require_report_type=True,
-        )
+        indicator_row = None
+        income_row = None
+        cashflow_row = None
+        if target_end_date is not None:
+            indicator_row = _select_report_row(
+                frames.get("fina_indicator"),
+                visible_date=visible_date,
+                end_date=target_end_date,
+            )
+            income_row = _select_report_row(
+                frames.get("income"),
+                visible_date=visible_date,
+                end_date=target_end_date,
+                require_report_type=True,
+            )
+            cashflow_row = _select_report_row(
+                frames.get("cashflow"),
+                visible_date=visible_date,
+                end_date=target_end_date,
+                require_report_type=True,
+            )
 
         if indicator_row is not None:
             revenue_yoy = _safe_float(indicator_row.get("tr_yoy"))
@@ -357,16 +378,12 @@ class TushareFundamentalAdapter:
                 revenue_yoy = _safe_float(indicator_row.get("or_yoy"))
             revenue_basis = "cumulative" if revenue_yoy is not None else None
             if revenue_yoy is None:
-                revenue_yoy = _safe_float(indicator_row.get("q_sales_yoy"))
-                if revenue_yoy is None:
-                    revenue_yoy = _safe_float(indicator_row.get("q_gr_yoy"))
+                revenue_yoy = _safe_float(indicator_row.get("q_gr_yoy"))
                 revenue_basis = "single_quarter" if revenue_yoy is not None else None
             net_profit_yoy = _safe_float(indicator_row.get("netprofit_yoy"))
             net_profit_basis = "cumulative" if net_profit_yoy is not None else None
             if net_profit_yoy is None:
                 net_profit_yoy = _safe_float(indicator_row.get("q_profit_yoy"))
-                if net_profit_yoy is None:
-                    net_profit_yoy = _safe_float(indicator_row.get("q_netprofit_yoy"))
                 net_profit_basis = "single_quarter" if net_profit_yoy is not None else None
             result["growth"] = {
                 "revenue_yoy": revenue_yoy,
@@ -457,10 +474,41 @@ class TushareFundamentalAdapter:
         if not _supported_cn_stock(stock_code):
             return _empty_capital_flow()
         ts_code = _to_ts_code(stock_code)
+        china_now = self._shanghai_now()
+        current_date = china_now.strftime("%Y%m%d")
+        completed_trade_dates: Optional[List[str]] = None
+        if self._trade_date_resolver is not None:
+            resolved_dates = self._trade_date_resolver(current_date)
+            normalized_dates = set()
+            for value in resolved_dates:
+                parsed = pd.to_datetime(value, errors="coerce")
+                if pd.isna(parsed):
+                    continue
+                trade_date = parsed.strftime("%Y%m%d")
+                if trade_date > current_date:
+                    continue
+                if (
+                    trade_date == current_date
+                    and china_now.time() < datetime_time(19, 0)
+                ):
+                    continue
+                normalized_dates.add(trade_date)
+            completed_trade_dates = sorted(normalized_dates, reverse=True)[:10]
+
+        moneyflow_request: Dict[str, Any] = {"ts_code": ts_code}
+        sector_request: Dict[str, Any] = {}
+        if completed_trade_dates:
+            moneyflow_request.update(
+                {
+                    "start_date": completed_trade_dates[-1],
+                    "end_date": completed_trade_dates[0],
+                }
+            )
+            sector_request["trade_date"] = completed_trade_dates[0]
         frames, errors, attempted = self._run_endpoints(
             {
-                "moneyflow": {"ts_code": ts_code},
-                "moneyflow_ind_ths": {},
+                "moneyflow": moneyflow_request,
+                "moneyflow_ind_ths": sector_request,
             },
             timeout_seconds=timeout_seconds,
             max_workers=2,
@@ -479,14 +527,21 @@ class TushareFundamentalAdapter:
             work = stock_df[["trade_date", "net_mf_amount"]].copy()
             work["__trade_date"] = pd.to_datetime(work["trade_date"], errors="coerce")
             work["net_mf_amount"] = pd.to_numeric(work["net_mf_amount"], errors="coerce")
-            china_now = self._shanghai_now()
-            completed_date = china_now.date()
-            if china_now.time() < datetime_time(15, 30):
-                completed_date -= timedelta(days=1)
-            work = work[
-                (work["__trade_date"].dt.date <= completed_date)
-                & work["net_mf_amount"].notna()
-            ].sort_values("__trade_date", ascending=False)
+            work["__compact_trade_date"] = work["__trade_date"].dt.strftime("%Y%m%d")
+            if completed_trade_dates is not None:
+                work = work[work["__compact_trade_date"].isin(completed_trade_dates)]
+            else:
+                # 默认构造仍可独立使用；返回行本身即交易日，只排除 19:00 前的当日数据。
+                work = work[
+                    (work["__compact_trade_date"] < current_date)
+                    | (
+                        (work["__compact_trade_date"] == current_date)
+                        & (china_now.time() >= datetime_time(19, 0))
+                    )
+                ]
+            work = work[work["net_mf_amount"].notna()].sort_values(
+                "__trade_date", ascending=False
+            )
             latest_ten = work.head(10)
             if not latest_ten.empty:
                 values = latest_ten["net_mf_amount"].tolist()
@@ -498,27 +553,44 @@ class TushareFundamentalAdapter:
                     "net_mf_amount": float(values[0]),
                     "net_mf_amount_5d": float(sum(values[:5])) if len(values) >= 5 else None,
                     "net_mf_amount_10d": float(sum(values[:10])) if len(values) >= 10 else None,
+                    "net_flow_kind": "net_mf_amount",
                     "amount_unit": "万元",
                 }
 
         sector_df = frames.get("moneyflow_ind_ths")
         if isinstance(sector_df, pd.DataFrame) and not sector_df.empty and {
             "industry",
-            "net_amount",
+            "net_buy_amount",
         }.issubset(sector_df.columns):
             work = sector_df.copy()
             if "trade_date" in work.columns:
                 work["__trade_date"] = pd.to_datetime(work["trade_date"], errors="coerce")
-                latest_trade_date = work["__trade_date"].max()
-                work = work[work["__trade_date"] == latest_trade_date]
-            work["__net_amount"] = pd.to_numeric(work["net_amount"], errors="coerce") / 10000.0
-            work = work.dropna(subset=["__net_amount"])
+                work["__compact_trade_date"] = work["__trade_date"].dt.strftime("%Y%m%d")
+                if completed_trade_dates is not None:
+                    latest_completed = completed_trade_dates[0] if completed_trade_dates else None
+                    work = work[work["__compact_trade_date"] == latest_completed]
+                else:
+                    work = work[
+                        (work["__compact_trade_date"] < current_date)
+                        | (
+                            (work["__compact_trade_date"] == current_date)
+                            & (china_now.time() >= datetime_time(19, 0))
+                        )
+                    ]
+                    latest_trade_date = work["__trade_date"].max()
+                    work = work[work["__trade_date"] == latest_trade_date]
+            elif completed_trade_dates == []:
+                work = work.iloc[0:0]
+            work["__net_buy_amount"] = pd.to_numeric(
+                work["net_buy_amount"], errors="coerce"
+            )
+            work = work.dropna(subset=["__net_buy_amount"])
 
             def normalize_rankings(frame: pd.DataFrame) -> list[Dict[str, Any]]:
                 return [
                     {
                         "name": _safe_str(row.get("industry")),
-                        "net_amount": float(row["__net_amount"]),
+                        "net_buy_amount": float(row["__net_buy_amount"]),
                         "amount_unit": "亿元",
                     }
                     for _, row in frame.iterrows()
@@ -527,8 +599,8 @@ class TushareFundamentalAdapter:
             limit = max(0, int(top_n))
             # 排序必须覆盖完整行业列表，否则 API 原始行序会伪造榜首/榜尾。
             result["sector_rankings"] = {
-                "top": normalize_rankings(work.nlargest(limit, "__net_amount")),
-                "bottom": normalize_rankings(work.nsmallest(limit, "__net_amount")),
+                "top": normalize_rankings(work.nlargest(limit, "__net_buy_amount")),
+                "bottom": normalize_rankings(work.nsmallest(limit, "__net_buy_amount")),
             }
 
         if result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"]:

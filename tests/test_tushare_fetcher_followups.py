@@ -106,6 +106,41 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
 
         # Data not ready, should fall back to Thursday (19th)
         self.assertEqual(result, "20260319")
+
+    def test_trade_calendar_lookback_covers_ten_sessions_across_long_holiday(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.trade_cal.return_value = pd.DataFrame(
+            {
+                "cal_date": [
+                    "20260223",
+                    "20260213",
+                    "20260212",
+                    "20260211",
+                    "20260210",
+                    "20260209",
+                    "20260206",
+                    "20260205",
+                    "20260204",
+                    "20260203",
+                    "20260202",
+                ],
+                "is_open": [1] * 11,
+            }
+        )
+
+        with patch.object(
+            fetcher,
+            "_get_china_now",
+            return_value=datetime(2026, 2, 23, 18, 59),
+        ), patch.object(fetcher, "_check_rate_limit"):
+            trade_dates = fetcher._get_trade_dates("20260223")
+
+        self.assertGreaterEqual(len(trade_dates), 10)
+        fetcher._api.trade_cal.assert_called_once_with(
+            exchange="SSE",
+            start_date="20260114",
+            end_date="20260223",
+        )
         
           
     def test_get_sector_rankings_rate_limits_calendar_and_rankings_api(self) -> None:
@@ -164,6 +199,10 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertEqual(fetcher._convert_stock_code("SH600519"), "600519.SH")
         self.assertEqual(fetcher._convert_stock_code("605218"), "605218.SH")
         self.assertEqual(fetcher._convert_stock_code("600519.SS"), "600519.SH")
+        self.assertEqual(fetcher._convert_stock_code("920748"), "920748.BJ")
+        self.assertEqual(fetcher._convert_stock_code("BJ920748"), "920748.BJ")
+        self.assertEqual(fetcher._convert_stock_code("BJ.920748"), "920748.BJ")
+        self.assertEqual(fetcher._convert_stock_code("920748.BJ"), "920748.BJ")
 
     @patch.dict(sys.modules, {"tushare": MagicMock()})
     def test_legacy_realtime_quote_keeps_sz_hint_as_stock_symbol(self) -> None:
@@ -208,23 +247,41 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
     def test_structured_capabilities_route_every_endpoint_through_fetcher_callback(self) -> None:
         fetcher = self._make_fetcher()
         calls = []
+        open_dates = [
+            "20260317",
+            "20260316",
+            "20260313",
+            "20260312",
+            "20260311",
+            "20260310",
+            "20260309",
+            "20260306",
+            "20260305",
+            "20260304",
+        ]
 
         class FakeApi:
             def __getattr__(self, api_name):
                 def call(**kwargs):
                     calls.append((api_name, kwargs))
+                    if api_name == "trade_cal":
+                        return pd.DataFrame(
+                            {"cal_date": open_dates, "is_open": [1] * len(open_dates)}
+                        )
                     return pd.DataFrame()
 
                 return call
 
         fetcher._api = FakeApi()
 
-        fetcher.get_fundamental_bundle("600519", timeout_seconds=1.0)
-        fetcher.get_capital_flow("600519", timeout_seconds=1.0, top_n=3)
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 3, 17, 20, 0)):
+            fetcher.get_fundamental_bundle("600519", timeout_seconds=1.0)
+            fetcher.get_capital_flow("600519", timeout_seconds=1.0, top_n=3)
 
         self.assertEqual(
             {api_name for api_name, _ in calls},
             {
+                "trade_cal",
                 "fina_indicator",
                 "income",
                 "cashflow",
@@ -237,7 +294,19 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
             },
         )
         moneyflow_kwargs = next(kwargs for api_name, kwargs in calls if api_name == "moneyflow")
-        self.assertEqual(moneyflow_kwargs["ts_code"], "600519.SH")
+        self.assertEqual(
+            moneyflow_kwargs,
+            {
+                "ts_code": "600519.SH",
+                "start_date": "20260304",
+                "end_date": "20260317",
+            },
+        )
+        sector_kwargs = next(
+            kwargs for api_name, kwargs in calls if api_name == "moneyflow_ind_ths"
+        )
+        self.assertEqual(sector_kwargs, {"trade_date": "20260317"})
+        self.assertEqual(fetcher._call_count, 10)
 
     def test_shared_api_slots_cap_all_tushare_calls_and_counter_has_no_lost_updates(self) -> None:
         fetcher = self._make_fetcher()
