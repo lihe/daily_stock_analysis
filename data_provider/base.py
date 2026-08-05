@@ -2994,7 +2994,31 @@ class DataFetcherManager:
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
                     if age <= cache_ttl:
-                        return cache_item.get("context", {})
+                        cached_context = cache_item.get("context", {})
+                        if realtime_quote is None or not isinstance(cached_context, dict):
+                            return cached_context
+                        valuation_payload = {
+                            "pe_ratio": getattr(realtime_quote, "pe_ratio", None),
+                            "pb_ratio": getattr(realtime_quote, "pb_ratio", None),
+                            "total_mv": getattr(realtime_quote, "total_mv", None),
+                            "circ_mv": getattr(realtime_quote, "circ_mv", None),
+                        }
+                        valuation_status = self._infer_block_status(valuation_payload, "partial")
+                        valuation = self._build_fundamental_block(
+                            valuation_status,
+                            valuation_payload,
+                            self._normalize_source_chain(
+                                [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": 0}],
+                                "realtime_quote",
+                                valuation_status,
+                                0,
+                            ),
+                        )
+                        # 只替换本轮估值且复制顶层对象，避免新行情污染跨请求复用的缓存。
+                        reused_context = dict(cached_context)
+                        reused_context["valuation"] = valuation
+                        logger.info("[基本面] %s 缓存命中，估值复用本轮实时行情", stock_code)
+                        return reused_context
 
         remaining_seconds = stage_timeout
         result_ctx: Dict[str, Any] = {

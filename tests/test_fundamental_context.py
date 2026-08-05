@@ -235,7 +235,7 @@ class TestFundamentalContext(unittest.TestCase):
             source=SimpleNamespace(value="tencent"),
         )
         with patch("src.config.get_config", return_value=cfg), \
-                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch.object(manager, "get_realtime_quote", return_value=quote) as fetch_quote, \
                 patch("data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle", return_value={
                     "growth": {"revenue_yoy": 10.1, "net_profit_yoy": 8.5},
                     "earnings": {"forecast_summary": "预增"},
@@ -252,6 +252,7 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertIn("growth", ctx)
         self.assertIn("capital_flow", ctx)
         self.assertIn("dragon_tiger", ctx)
+        fetch_quote.assert_called_once_with("600519")
 
     def test_fundamental_context_reuses_provided_realtime_quote(self) -> None:
         manager = DataFetcherManager(fetchers=[])
@@ -297,6 +298,53 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["valuation"]["data"]["pb_ratio"], 2.1)
         self.assertEqual(ctx["valuation"]["data"]["total_mv"], 1.0e11)
         self.assertEqual(ctx["valuation"]["data"]["circ_mv"], 7.0e10)
+
+    def test_fundamental_context_reuses_quote_when_cache_hits(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        cached_quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0e11, circ_mv=7.0e10)
+        current_quote = SimpleNamespace(pe_ratio=20.0, pb_ratio=2.0, total_mv=2.0e11, circ_mv=1.4e11)
+        bundle = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=cached_quote) as fetch_quote, \
+                patch(
+                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
+                    return_value=bundle,
+                ), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            manager.get_fundamental_context("600519", budget_seconds=1.5)
+            ctx = manager.get_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                realtime_quote=current_quote,
+            )
+
+        fetch_quote.assert_called_once_with("600519")
+        self.assertEqual(ctx["valuation"]["data"]["pe_ratio"], 20.0)
+        cached_context = manager._fundamental_cache[manager._get_fundamental_cache_key("600519", 1.5)]["context"]
+        self.assertEqual(cached_context["valuation"]["data"]["pe_ratio"], 10.0)
+
+    def test_fundamental_context_realtime_quote_is_keyword_only(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        quote = SimpleNamespace(pe_ratio=12.3)
+
+        with self.assertRaises(TypeError):
+            manager.get_fundamental_context("600519", 1.5, quote)
 
     def test_fundamental_context_derives_ttm_dividend_yield_from_quote_price(self) -> None:
         manager = DataFetcherManager(fetchers=[])
