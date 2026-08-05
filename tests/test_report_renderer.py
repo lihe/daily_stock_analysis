@@ -245,7 +245,7 @@ class TestReportRenderer(unittest.TestCase):
         r.market_phase_summary = {"phase": "postmarket", "market": "cn"}
         market_now = datetime(2026, 8, 5, 17, 8, 42, tzinfo=ZoneInfo("Asia/Shanghai"))
 
-        with patch("src.services.report_renderer.get_market_now", return_value=market_now):
+        with patch("src.services.report_renderer.resolve_report_now", return_value=market_now):
             out = render("markdown", [r], summary_only=False)
 
         self.assertIsNotNone(out)

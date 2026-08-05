@@ -17,8 +17,10 @@ TODO:
 import os
 import sys
 import unittest
-from unittest import mock
+from datetime import datetime
 from typing import Optional
+from unittest import mock
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -638,6 +640,53 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         out = service.generate_dashboard_report([result], report_date="2026-02-01")
 
         self.assertIn("*分析模型：gemini/gemini-2.5-flash*", out)
+
+    @mock.patch("src.notification.resolve_report_now")
+    @mock.patch("src.notification.get_config")
+    def test_generate_dashboard_report_fallback_uses_market_clock_and_phase_decision(
+        self,
+        mock_get_config: mock.MagicMock,
+        mock_resolve_report_now: mock.MagicMock,
+    ):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        mock_resolve_report_now.return_value = datetime(
+            2026,
+            8,
+            5,
+            17,
+            51,
+            52,
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        )
+        service = NotificationService()
+        result = AnalysisResult(
+            code="600797",
+            name="浙大网新",
+            sentiment_score=59,
+            trend_prediction="看多",
+            operation_advice="持有观察",
+            analysis_summary="等待下一交易日确认",
+            dashboard={
+                "phase_decision": {
+                    "action_window": "盘后复盘",
+                    "immediate_action": "无盘中动作",
+                    "watch_conditions": ["观察次日承接"],
+                    "next_check_time": "2026-08-06 09:30",
+                    "confidence_reason": "常规交易时段已结束",
+                    "data_limitations": ["筹码数据缺失"],
+                }
+            },
+        )
+        result.market_phase_summary = {"phase": "postmarket", "market": "cn"}
+
+        out = service.generate_dashboard_report([result])
+
+        self.assertIn("# 🎯 2026-08-05", out)
+        self.assertIn("### 🛡️ 阶段决策护栏", out)
+        self.assertIn("| 盘后复盘 | 无盘中动作 | 2026-08-06 09:30 |", out)
+        self.assertIn("**观察条件**:\n- 观察次日承接", out)
+        self.assertIn("*报告生成时间：2026-08-05 17:51:52+08:00*", out)
+        self.assertNotIn("盘中决策护栏", out)
 
     @mock.patch("src.notification.get_config")
     def test_generate_dashboard_report_appends_decision_signal_excerpt_fallback(

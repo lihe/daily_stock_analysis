@@ -25,7 +25,11 @@ from enum import Enum
 
 from src.config import Config, get_config
 from src.enums import ReportType
-from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
+from src.market_phase_summary import (
+    format_public_market_status_line,
+    format_public_phase_pack_excerpt,
+    resolve_report_now,
+)
 from src.services.decision_signal_summary import format_decision_signal_excerpt
 from src.services.hhxg_data_service import render_hhxg_data_evidence
 from src.services.official_hard_event_service import render_official_hard_event_evidence
@@ -389,6 +393,52 @@ class NotificationService(
         if status_line:
             lines.extend([status_line, ""])
         elif lines and lines[-1] != "":
+            lines.append("")
+
+    @staticmethod
+    def _append_phase_decision_section(
+        lines: List[str],
+        dashboard: Dict[str, Any],
+        labels: Dict[str, str],
+    ) -> None:
+        phase_decision = dashboard.get("phase_decision") if isinstance(dashboard, dict) else None
+        if not isinstance(phase_decision, dict):
+            return
+        content_keys = (
+            "action_window",
+            "immediate_action",
+            "watch_conditions",
+            "next_check_time",
+            "confidence_reason",
+            "data_limitations",
+        )
+        if not any(phase_decision.get(key) for key in content_keys):
+            return
+
+        lines.extend([
+            f"### 🛡️ {labels['phase_decision_heading']}",
+            "",
+            f"| {labels['action_window_label']} | {labels['immediate_action_label']} | {labels['next_check_time_label']} |",
+            "|---------|---------|---------|",
+            f"| {phase_decision.get('action_window') or 'N/A'} | "
+            f"{phase_decision.get('immediate_action') or 'N/A'} | "
+            f"{phase_decision.get('next_check_time') or 'N/A'} |",
+            "",
+        ])
+        watch_conditions = phase_decision.get("watch_conditions")
+        if isinstance(watch_conditions, list) and watch_conditions:
+            lines.append(f"**{labels['watch_conditions_label']}**:")
+            lines.extend(f"- {condition}" for condition in watch_conditions if condition)
+            lines.append("")
+        if phase_decision.get("confidence_reason"):
+            lines.extend([
+                f"**{labels['confidence_reason_label']}**: {phase_decision['confidence_reason']}",
+                "",
+            ])
+        data_limitations = phase_decision.get("data_limitations")
+        if isinstance(data_limitations, list) and data_limitations:
+            lines.append(f"**{labels['data_limitations_label']}**:")
+            lines.extend(f"- {limitation}" for limitation in data_limitations if limitation)
             lines.append("")
 
     def _should_show_llm_model(self) -> bool:
@@ -1061,6 +1111,7 @@ class NotificationService(
             Markdown 格式的决策仪表盘日报
         """
         config = get_config()
+        report_now = resolve_report_now(results)
         report_language = self._get_report_language(results)
         labels = get_report_labels(report_language)
         reason_label = "Rationale" if report_language == "en" else "操作理由"
@@ -1085,7 +1136,7 @@ class NotificationService(
                 return out
 
         if report_date is None:
-            report_date = datetime.now().strftime('%Y-%m-%d')
+            report_date = report_now.strftime('%Y-%m-%d')
 
         # 按评分排序（高分在前）
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
@@ -1279,6 +1330,8 @@ class NotificationService(
                                 f"**{labels['chip_label']}**: {chip_unavailable_reason}",
                                 "",
                             ])
+
+                self._append_phase_decision_section(report_lines, dashboard, labels)
                 
                 # ========== 作战计划 ==========
                 battle = dashboard.get('battle_plan', {}) if dashboard else {}
@@ -1365,7 +1418,7 @@ class NotificationService(
         # 底部（去除免责声明）
         report_lines.extend([
             "",
-            f"*{labels['generated_at_label']}：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+            f"*{labels['generated_at_label']}：{report_now.isoformat(sep=' ', timespec='seconds')}*",
         ])
         models = self._collect_models_used(results)
         if models:

@@ -8,7 +8,7 @@ from datetime import datetime
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
-from src.core.trading_calendar import MarketPhase, build_market_phase_context, get_market_for_stock
+from src.core.trading_calendar import MarketPhase, build_market_phase_context, get_market_for_stock, get_market_now
 
 
 MARKET_PHASE_SUMMARY_KEY = "market_phase_summary"
@@ -48,6 +48,20 @@ _PUBLIC_SOURCE_LABELS_EN = {
     "evaluator_snapshot": "evaluator snapshot",
     "legacy_text": "legacy text",
 }
+
+
+def resolve_report_now(results: List[Any]) -> datetime:
+    """Resolve report generation time in the first result's market timezone."""
+    market: Optional[str] = None
+    for result in results or []:
+        summary = getattr(result, MARKET_PHASE_SUMMARY_KEY, None)
+        if isinstance(summary, Mapping) and summary.get("market"):
+            market = str(summary["market"]).strip() or None
+            break
+    report_now = get_market_now(market)
+    return report_now if report_now.tzinfo is not None else report_now.astimezone()
+
+
 _MARKET_STATUS_PREFIX = {
     "zh": "市场状态",
     "en": "Market status",
