@@ -258,3 +258,37 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
 
         self.assertLessEqual(peak_active, 4)
         self.assertEqual(fetcher._call_count, 12)
+
+    def test_get_daily_data_routes_real_public_path_through_shared_api_wrapper(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.daily.return_value = pd.DataFrame(
+            {
+                "trade_date": ["20260105", "20260102"],
+                "open": [10.0, 9.8],
+                "high": [10.3, 10.0],
+                "low": [9.9, 9.7],
+                "close": [10.2, 9.9],
+                "vol": [100.0, 80.0],
+                "amount": [1000.0, 800.0],
+                "pct_chg": [3.0, 1.0],
+            }
+        )
+
+        with patch.object(fetcher, "_check_rate_limit"), patch.object(
+            fetcher,
+            "_call_api_with_rate_limit",
+            wraps=fetcher._call_api_with_rate_limit,
+        ) as api_wrapper:
+            result = fetcher.get_daily_data(
+                "600519",
+                start_date="2026-01-01",
+                end_date="2026-01-05",
+            )
+
+        self.assertFalse(result.empty)
+        api_wrapper.assert_called_once_with(
+            "daily",
+            ts_code="600519.SH",
+            start_date="20260101",
+            end_date="20260105",
+        )

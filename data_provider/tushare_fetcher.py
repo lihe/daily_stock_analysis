@@ -503,9 +503,6 @@ class TushareFetcher(BaseFetcher):
         if _is_us_code(stock_code):
             raise DataFetchError(f"TushareFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
         
-        # Rate-limit check
-        self._check_rate_limit()
-        
         is_hk = _is_hk_market(stock_code)
          # 判断是否为 ETF / 港股，以选择不同接口
         is_etf = _is_etf_code(stock_code)
@@ -527,21 +524,24 @@ class TushareFetcher(BaseFetcher):
         try:
             if is_hk:
                 # 港股使用 hk_daily 接口
-                df = self._api.hk_daily(
+                df = self._call_api_with_rate_limit(
+                    "hk_daily",
                     ts_code=ts_code,
                     start_date=ts_start,
                     end_date=ts_end,
                 )
             elif is_etf:
                 # ETF uses fund_daily interface
-                df = self._api.fund_daily(
+                df = self._call_api_with_rate_limit(
+                    "fund_daily",
                     ts_code=ts_code,
                     start_date=ts_start,
                     end_date=ts_end,
                 )
             else:
                 # Regular A-share stocks use daily interface
-                df = self._api.daily(
+                df = self._call_api_with_rate_limit(
+                    "daily",
                     ts_code=ts_code,
                     start_date=ts_start,
                     end_date=ts_end,
@@ -633,29 +633,28 @@ class TushareFetcher(BaseFetcher):
             self._stock_name_cache = {}
         
         try:
-            # 速率限制检查
-            self._check_rate_limit()
-            
-
             # 根据市场/类型选择基础信息接口
             if _is_hk_market(stock_code):
                 ts_code = self._convert_hk_stock_code_for_tushare(stock_code)
                 # 港股：使用 hk_basic
-                df = self._api.hk_basic(
+                df = self._call_api_with_rate_limit(
+                    "hk_basic",
                     ts_code=ts_code,
                     fields='ts_code,name'
                 )
             elif _is_etf_code(stock_code):
                 ts_code = self._convert_stock_code(stock_code)
                 # ETF：使用 fund_basic
-                df = self._api.fund_basic(
+                df = self._call_api_with_rate_limit(
+                    "fund_basic",
                     ts_code=ts_code,
                     fields='ts_code,name'
                 )
             else:
                 ts_code = self._convert_stock_code(stock_code)
                 # A 股股票：使用 stock_basic
-                df = self._api.stock_basic(
+                df = self._call_api_with_rate_limit(
+                    "stock_basic",
                     ts_code=ts_code,
                     fields='ts_code,name'
                 )
@@ -685,9 +684,8 @@ class TushareFetcher(BaseFetcher):
             return None
         
         try:
-            self._check_rate_limit()
-
-            df = self._api.stock_basic(
+            df = self._call_api_with_rate_limit(
+                "stock_basic",
                 exchange='',
                 list_status='L',
                 fields='ts_code,name,industry,area,market'
@@ -741,14 +739,11 @@ class TushareFetcher(BaseFetcher):
             safe_float, safe_int
         )
 
-        # 速率限制检查
-        self._check_rate_limit()
-
         # 尝试 Pro 接口
         try:
             ts_code = self._convert_stock_code(stock_code)
             # 尝试调用 Pro 实时接口 (需要积分)
-            df = self._api.quotation(ts_code=ts_code)
+            df = self._call_api_with_rate_limit("quotation", ts_code=ts_code)
 
             if df is not None and not df.empty:
                 row = df.iloc[0]
@@ -842,8 +837,6 @@ class TushareFetcher(BaseFetcher):
         }
 
         try:
-            self._check_rate_limit()
-
             # Tushare index_daily 获取历史数据，实时数据需用其他接口或估算
             # 由于 Tushare 免费用户可能无法获取指数实时行情，这里作为备选
             # 使用 index_daily 获取最近交易日数据
@@ -856,7 +849,12 @@ class TushareFetcher(BaseFetcher):
             # 批量获取所有指数数据
             for ts_code, name in indices_map.items():
                 try:
-                    df = self._api.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+                    df = self._call_api_with_rate_limit(
+                        "index_daily",
+                        ts_code=ts_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
                     if df is not None and not df.empty:
                         row = df.iloc[0] # 最新一天
 

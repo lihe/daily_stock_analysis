@@ -35,6 +35,38 @@ def test_fundamental_bundle_routes_every_endpoint_through_callback() -> None:
     assert all(kwargs["ts_code"] == "600519.SH" for _, kwargs in calls)
 
 
+def test_structured_capabilities_fail_closed_for_non_cn_or_etf_without_callback() -> None:
+    unsupported_codes = ("510050", "HK00700", "00700.HK", "AAPL", "7203.T")
+
+    for stock_code in unsupported_codes:
+        calls: list[str] = []
+
+        def callback(api_name: str, **_) -> pd.DataFrame:
+            calls.append(api_name)
+            return pd.DataFrame()
+
+        adapter = TushareFundamentalAdapter(callback)
+        bundle = adapter.get_fundamental_bundle(stock_code, timeout_seconds=1.0)
+        capital_flow = adapter.get_capital_flow(stock_code, timeout_seconds=1.0)
+
+        assert bundle == {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        assert capital_flow == {
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        }
+        assert calls == []
+
+
 def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> None:
     frames = {
         "fina_indicator": pd.DataFrame(
@@ -140,6 +172,33 @@ def test_fundamental_bundle_selects_latest_visible_consolidated_revision() -> No
         "report_type": 1,
     }
     assert result["status"] == "partial"
+
+
+def test_missing_report_type_and_dividend_status_fail_closed() -> None:
+    today = date.today().strftime("%Y%m%d")
+    frames = {
+        "fina_indicator": pd.DataFrame(
+            [{"end_date": "20260331", "ann_date": "20260420", "tr_yoy": 99.0}]
+        ),
+        "income": pd.DataFrame(
+            [{"end_date": "20260331", "ann_date": "20260420", "total_revenue": 999.0}]
+        ),
+        "cashflow": pd.DataFrame(
+            [{"end_date": "20260331", "ann_date": "20260420", "n_cashflow_act": 999.0}]
+        ),
+        "dividend": pd.DataFrame(
+            [{"ann_date": today, "ex_date": today, "cash_div": 0.2, "cash_div_tax": 0.3}]
+        ),
+    }
+    adapter = TushareFundamentalAdapter(lambda api_name, **_: frames.get(api_name, pd.DataFrame()))
+
+    result = adapter.get_fundamental_bundle("600519", timeout_seconds=1.0)
+
+    assert result["status"] == "not_supported"
+    assert result["growth"] == {}
+    assert result["earnings"] == {}
+    assert "financial_report" not in result["earnings"]
+    assert "dividend" not in result["earnings"]
 
 
 def test_growth_uses_single_quarter_fields_only_when_cumulative_fields_are_missing() -> None:

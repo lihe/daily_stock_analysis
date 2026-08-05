@@ -13,6 +13,60 @@ import pandas as pd
 
 ApiCallback = Callable[..., pd.DataFrame]
 
+_ETF_PREFIXES = ("15", "16", "18", "51", "52", "56", "58")
+_CN_STOCK_EXCHANGES = {
+    "SH": ("600", "601", "603", "605", "688"),
+    "SZ": ("000", "001", "002", "003", "300", "301"),
+    "BJ": ("43", "81", "82", "83", "87", "88", "92"),
+}
+
+
+def _supported_cn_stock(stock_code: str) -> bool:
+    """只接受可明确归属交易所的 A 股，未知代码宁可不请求。"""
+    raw = str(stock_code).strip().upper()
+    exchange_hint: Optional[str] = None
+    if raw.startswith(("SH", "SZ", "BJ")):
+        exchange_hint, raw = raw[:2], raw[2:]
+    elif "." in raw:
+        raw, exchange_hint = raw.split(".", 1)
+        if exchange_hint == "SS":
+            exchange_hint = "SH"
+
+    if not raw.isdigit() or len(raw) != 6 or raw.startswith(_ETF_PREFIXES):
+        return False
+    expected_exchange = next(
+        (
+            exchange
+            for exchange, prefixes in _CN_STOCK_EXCHANGES.items()
+            if raw.startswith(prefixes)
+        ),
+        None,
+    )
+    if expected_exchange is None:
+        return False
+    return exchange_hint in (None, expected_exchange)
+
+
+def _empty_fundamental_bundle() -> Dict[str, Any]:
+    return {
+        "status": "not_supported",
+        "growth": {},
+        "earnings": {},
+        "institution": {},
+        "source_chain": [],
+        "errors": [],
+    }
+
+
+def _empty_capital_flow() -> Dict[str, Any]:
+    return {
+        "status": "not_supported",
+        "stock_flow": {},
+        "sector_rankings": {"top": [], "bottom": []},
+        "source_chain": [],
+        "errors": [],
+    }
+
 
 def _to_ts_code(stock_code: str) -> str:
     code = str(stock_code).strip().upper()
@@ -58,11 +112,17 @@ def _announcement_value(row: pd.Series) -> Any:
     return row.get("ann_date")
 
 
-def _select_report_row(df: Optional[pd.DataFrame], end_date: Optional[str] = None) -> Optional[pd.Series]:
+def _select_report_row(
+    df: Optional[pd.DataFrame],
+    end_date: Optional[str] = None,
+    require_report_type: bool = False,
+) -> Optional[pd.Series]:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return None
 
     work = df.copy()
+    if require_report_type and "report_type" not in work.columns:
+        return None
     if "report_type" in work.columns:
         work = work[work["report_type"].astype(str).str.strip() == "1"]
     if end_date is not None and "end_date" in work.columns:
@@ -84,13 +144,13 @@ def _select_report_row(df: Optional[pd.DataFrame], end_date: Optional[str] = Non
 
 
 def _build_dividend_payload(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
-    if not isinstance(df, pd.DataFrame) or df.empty:
+    if not isinstance(df, pd.DataFrame) or df.empty or "div_proc" not in df.columns:
         return {}
 
     cutoff = date.today() - timedelta(days=365)
     events = []
     for _, row in df.iterrows():
-        if "div_proc" in df.columns and _safe_str(row.get("div_proc")) != "实施":
+        if _safe_str(row.get("div_proc")) != "实施":
             continue
         ex_date = pd.to_datetime(row.get("ex_date"), errors="coerce")
         if pd.isna(ex_date) or not cutoff <= ex_date.date() <= date.today():
@@ -219,6 +279,8 @@ class TushareFundamentalAdapter:
         return frames, errors, attempted
 
     def get_fundamental_bundle(self, stock_code: str, timeout_seconds: float) -> Dict[str, Any]:
+        if not _supported_cn_stock(stock_code):
+            return _empty_fundamental_bundle()
         ts_code = _to_ts_code(stock_code)
         frames, errors, attempted = self._run_endpoints(
             {api_name: {"ts_code": ts_code} for api_name in self._FUNDAMENTAL_ENDPOINTS},
@@ -227,23 +289,32 @@ class TushareFundamentalAdapter:
             thread_name_prefix="tushare-fundamental",
         )
 
-        result: Dict[str, Any] = {
-            "status": "not_supported",
-            "growth": {},
-            "earnings": {},
-            "institution": {},
-            "source_chain": [f"tushare.{api_name}" for api_name in attempted],
-            "errors": errors,
-        }
+        result = _empty_fundamental_bundle()
+        result["source_chain"] = [f"tushare.{api_name}" for api_name in attempted]
+        result["errors"] = errors
 
-        indicator_row = _select_report_row(frames.get("fina_indicator"))
+        indicator_row = _select_report_row(
+            frames.get("fina_indicator"),
+            require_report_type=True,
+        )
         if indicator_row is None:
-            income_anchor = _select_report_row(frames.get("income"))
+            income_anchor = _select_report_row(
+                frames.get("income"),
+                require_report_type=True,
+            )
             target_end_date = str(income_anchor.get("end_date")) if income_anchor is not None else None
         else:
             target_end_date = str(indicator_row.get("end_date"))
-        income_row = _select_report_row(frames.get("income"), target_end_date)
-        cashflow_row = _select_report_row(frames.get("cashflow"), target_end_date)
+        income_row = _select_report_row(
+            frames.get("income"),
+            target_end_date,
+            require_report_type=True,
+        )
+        cashflow_row = _select_report_row(
+            frames.get("cashflow"),
+            target_end_date,
+            require_report_type=True,
+        )
 
         if indicator_row is not None:
             revenue_yoy = _safe_float(indicator_row.get("tr_yoy"))
@@ -336,6 +407,8 @@ class TushareFundamentalAdapter:
         timeout_seconds: float,
         top_n: int = 5,
     ) -> Dict[str, Any]:
+        if not _supported_cn_stock(stock_code):
+            return _empty_capital_flow()
         ts_code = _to_ts_code(stock_code)
         frames, errors, attempted = self._run_endpoints(
             {
@@ -347,13 +420,9 @@ class TushareFundamentalAdapter:
             thread_name_prefix="tushare-capital-flow",
         )
 
-        result: Dict[str, Any] = {
-            "status": "not_supported",
-            "stock_flow": {},
-            "sector_rankings": {"top": [], "bottom": []},
-            "source_chain": [f"tushare.{api_name}" for api_name in attempted],
-            "errors": errors,
-        }
+        result = _empty_capital_flow()
+        result["source_chain"] = [f"tushare.{api_name}" for api_name in attempted]
+        result["errors"] = errors
 
         stock_df = frames.get("moneyflow")
         if isinstance(stock_df, pd.DataFrame) and not stock_df.empty and {
