@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urljoin
 
@@ -45,6 +45,7 @@ class ExchangeDisclosureClient:
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.retries = max(1, int(retries))
         self._requester = requester or requests.request
+        self._cninfo_sse_org_ids: Optional[Dict[str, str]] = None
 
     @staticmethod
     def exchange_for_code(code: str) -> Optional[str]:
@@ -188,6 +189,42 @@ class ExchangeDisclosureClient:
         start_date: date,
         end_date: date,
     ) -> OfficialQueryResult:
+        try:
+            return self._fetch_sse_announcements_primary(
+                code,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except OfficialSourceError as primary_error:
+            logger.warning(
+                "上交所公告 HTTPS 查询失败，尝试巨潮正式披露源: %s",
+                primary_error,
+            )
+            try:
+                result = self._fetch_cninfo_sse_announcements(
+                    code,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                logger.info(
+                    "巨潮沪市公告回退查询成功: code=%s records=%d",
+                    code,
+                    len(result.records),
+                )
+                return result
+            except OfficialSourceError as fallback_error:
+                raise OfficialSourceError(
+                    f"SSE announcement query failed; primary={primary_error}; "
+                    f"cninfo_fallback={fallback_error}"
+                ) from fallback_error
+
+    def _fetch_sse_announcements_primary(
+        self,
+        code: str,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> OfficialQueryResult:
         url = "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
         headers = {"Referer": "https://www.sse.com.cn/"}
         records: List[Dict[str, Any]] = []
@@ -247,6 +284,111 @@ class ExchangeDisclosureClient:
             raise OfficialSourceError("SSE announcement pagination limit reached before query window completed")
 
         return OfficialQueryResult("sse_announcement", "announcement", records)
+
+    def _fetch_cninfo_sse_announcements(
+        self,
+        code: str,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> OfficialQueryResult:
+        org_id = self._cninfo_sse_org_id(code)
+        url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+        headers = {
+            "Referer": (
+                "https://www.cninfo.com.cn/new/disclosure/stock"
+                f"?stockCode={code}&orgId={org_id}"
+            ),
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        records: List[Dict[str, Any]] = []
+
+        completed = False
+        for page_num in range(1, 21):
+            payload = {
+                "pageNum": str(page_num),
+                "pageSize": "30",
+                "column": "sse",
+                "tabName": "fulltext",
+                "plate": "sse",
+                "stock": f"{code},{org_id}",
+                "searchkey": "",
+                "secid": "",
+                "category": "",
+                "trade": "",
+                "seDate": f"{start_date.isoformat()}~{end_date.isoformat()}",
+                "sortName": "",
+                "sortType": "",
+                "isHLtitle": "true",
+            }
+            data = self._request_json("POST", url, headers=headers, data=payload)
+            rows = data.get("announcements") if isinstance(data, dict) else None
+            if not isinstance(rows, list):
+                raise OfficialSourceError("CNINFO announcement response is missing announcements[]")
+
+            for row in rows:
+                if not isinstance(row, dict) or str(row.get("secCode") or "") != code:
+                    continue
+                publish_date = _parse_date(row.get("announcementTime"))
+                if publish_date is None or not (start_date <= publish_date <= end_date):
+                    continue
+                path = str(row.get("adjunctUrl") or "").strip()
+                records.append(
+                    {
+                        "source": "sse_announcement",
+                        "category": "announcement",
+                        "external_id": str(row.get("announcementId") or path or ""),
+                        "stock_code": code,
+                        "title": str(row.get("announcementTitle") or "").strip(),
+                        "publish_date": publish_date.isoformat(),
+                        "source_url": (
+                            urljoin("https://static.cninfo.com.cn/", path) if path else ""
+                        ),
+                        "raw_fields": {
+                            "provider": "cninfo",
+                            "org_id": row.get("orgId") or org_id,
+                            "announcement_type": row.get("announcementType"),
+                        },
+                    }
+                )
+
+            has_more = data.get("hasMore")
+            total_pages = _safe_int(data.get("totalpages"), default=page_num)
+            if not rows or has_more is False:
+                completed = True
+                break
+            if has_more is None and page_num >= total_pages:
+                completed = True
+                break
+
+        if not completed:
+            raise OfficialSourceError(
+                "CNINFO announcement pagination limit reached before query window completed"
+            )
+
+        return OfficialQueryResult("sse_announcement", "announcement", records)
+
+    def _cninfo_sse_org_id(self, code: str) -> str:
+        if self._cninfo_sse_org_ids is None:
+            url = "https://www.cninfo.com.cn/new/data/szse_stock.json"
+            data = self._request_json(
+                "GET",
+                url,
+                headers={"Referer": "https://www.cninfo.com.cn/"},
+            )
+            rows = data.get("stockList") if isinstance(data, dict) else None
+            if not isinstance(rows, list):
+                raise OfficialSourceError("CNINFO stock list response is missing stockList[]")
+            self._cninfo_sse_org_ids = {
+                str(row.get("code") or ""): str(row.get("orgId") or "")
+                for row in rows
+                if isinstance(row, dict) and row.get("code") and row.get("orgId")
+            }
+
+        org_id = self._cninfo_sse_org_ids.get(code, "")
+        if not org_id:
+            raise OfficialSourceError(f"CNINFO stock list does not contain SSE code {code}")
+        return org_id
 
     def fetch_szse_regulatory_measures(
         self,
@@ -383,7 +525,50 @@ class ExchangeDisclosureClient:
         start_date: date,
         end_date: date,
     ) -> OfficialQueryResult:
-        url = "https://query.sse.com.cn/commonSoaQuery.do"
+        primary_url = "https://query.sse.com.cn/commonSoaQuery.do"
+        try:
+            return self._fetch_sse_regulatory_from_url(
+                code,
+                start_date=start_date,
+                end_date=end_date,
+                url=primary_url,
+                transport="https_primary",
+            )
+        except OfficialSourceError as primary_error:
+            fallback_url = "http://query.sse.com.cn/commonSoaQuery.do"
+            logger.warning(
+                "上交所监管 HTTPS 查询失败，尝试同一官方接口 HTTP 入口: %s",
+                primary_error,
+            )
+            try:
+                result = self._fetch_sse_regulatory_from_url(
+                    code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    url=fallback_url,
+                    transport="http_fallback",
+                )
+                logger.info(
+                    "上交所监管 HTTP 回退查询成功: code=%s records=%d",
+                    code,
+                    len(result.records),
+                )
+                return result
+            except OfficialSourceError as fallback_error:
+                raise OfficialSourceError(
+                    f"SSE regulatory query failed; primary={primary_error}; "
+                    f"official_http_fallback={fallback_error}"
+                ) from fallback_error
+
+    def _fetch_sse_regulatory_from_url(
+        self,
+        code: str,
+        *,
+        start_date: date,
+        end_date: date,
+        url: str,
+        transport: str,
+    ) -> OfficialQueryResult:
         headers = {"Referer": "https://www.sse.com.cn/regulation/supervision/measures/"}
         records: List[Dict[str, Any]] = []
 
@@ -446,6 +631,7 @@ class ExchangeDisclosureClient:
                         "raw_fields": {
                             "channel_id": row.get("channelId"),
                             "involved_party": row.get("extTeacher"),
+                            "transport": transport,
                         },
                     }
                 )
@@ -480,6 +666,16 @@ class ExchangeDisclosureClient:
 
 
 def _parse_date(value: Any) -> Optional[date]:
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 100_000_000_000:
+            timestamp /= 1000
+        try:
+            cst = timezone(timedelta(hours=8))
+            return datetime.fromtimestamp(timestamp, tz=cst).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+
     text = str(value or "").strip()
     if len(text) < 10:
         return None
