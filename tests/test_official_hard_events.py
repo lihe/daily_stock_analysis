@@ -274,3 +274,82 @@ def test_unverified_news_hard_events_are_removed_before_llm():
     assert "券商观点认为估值合理" in sanitized
     assert "预告" not in sanitized
     assert "净利润" not in sanitized
+
+
+def test_unverified_hard_event_synonyms_are_removed_without_hiding_trading_advice():
+    text = (
+        "业绩预期承压。"
+        "当前动态市盈率为负，公司处于亏损状态。"
+        "公司收到警示函并被责令整改。"
+        "股票被实施退市风险警示。"
+        "审计报告被出具保留意见。"
+        "控股股东拟出售公司股份。"
+        "持仓浮动亏损达到3%，应执行止损。"
+        "走势走弱时应减仓。"
+        "行业景气预期承压。"
+    )
+
+    sanitized = sanitize_unverified_hard_event_context(text)
+
+    for leaked_claim in (
+        "业绩预期承压",
+        "公司处于亏损状态",
+        "警示函",
+        "责令整改",
+        "退市风险警示",
+        "保留意见",
+        "控股股东拟出售公司股份",
+    ):
+        assert leaked_claim not in sanitized
+    assert "持仓浮动亏损达到3%" in sanitized
+    assert "走势走弱时应减仓" in sanitized
+    assert "行业景气预期承压" in sanitized
+
+
+def test_unverified_english_hard_event_synonyms_are_removed():
+    text = (
+        "The company received a regulatory inquiry. "
+        "Management issued a profit warning. "
+        "The position has an unrealized loss of 3%. "
+        "Sector demand remains strong."
+    )
+
+    sanitized = sanitize_unverified_hard_event_context(text)
+
+    assert "regulatory inquiry" not in sanitized
+    assert "profit warning" not in sanitized
+    assert "unrealized loss of 3%" in sanitized
+    assert "Sector demand remains strong" in sanitized
+
+
+def test_guardrail_sanitizes_every_user_visible_narrative_field(tmp_path):
+    evidence = OfficialHardEventService(
+        client=_CompleteSzseClient(),
+        evidence_dir=tmp_path,
+    ).collect(
+        "002270",
+        "示例公司",
+        end_date=date(2026, 8, 4),
+        query_id="query-visible-fields",
+    )
+    result = _analysis_result()
+    narrative_fields = (
+        "trend_analysis",
+        "technical_analysis",
+        "ma_analysis",
+        "volume_analysis",
+        "pattern_analysis",
+        "sector_position",
+        "market_sentiment",
+        "hot_topics",
+    )
+    for field_name in narrative_fields:
+        setattr(result, field_name, "公司收到警示函。技术趋势保持强势。")
+
+    adjustments = apply_official_hard_event_guardrail(result, evidence)
+
+    for field_name in narrative_fields:
+        value = getattr(result, field_name)
+        assert "警示函" not in value
+        assert "技术趋势保持强势" in value
+        assert f"sanitized:{field_name}" in adjustments

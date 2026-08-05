@@ -90,10 +90,69 @@ _EARNINGS_TERMS = (
     "一季报",
     "三季报",
 )
-_SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?；;\n])")
+# 带上下文的同义表达用于补齐词表，同时避免把“减仓、持仓浮亏”等交易纪律误判为公司事件。
+_HARD_EVENT_PATTERNS = (
+    re.compile(
+        r"(?:公司|企业|发行人|上市公司|本期|报告期|年度|季度|财务|经营|业绩|"
+        r"动态市盈率|PE).{0,20}(?:亏损|盈利|扭亏|由盈转亏|由亏转盈|增亏|减亏)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:业绩|利润|营收|净利|财务表现).{0,12}"
+        r"(?:预期|预计|预测|承压|改善|增长|下降|下滑|大增|大减|亏损|盈利|扭亏)"
+    ),
+    re.compile(
+        r"(?:警示函|决定书|责令(?:改正|整改)|(?:自律|行政)监管措施|调查通知书)"
+    ),
+    re.compile(
+        r"(?:退市风险警示|其他风险警示|终止上市|暂停上市|恢复上市|"
+        r"实施\s*\*?ST|撤销\s*\*?ST|摘帽|戴帽)"
+    ),
+    re.compile(r"(?:暂停交易|恢复交易|临时停牌)"),
+    re.compile(
+        r"(?:审计(?:报告|意见)|非标准?审计意见|保留意见|否定意见|"
+        r"无法表示意见|财务报告|财报)"
+    ),
+    re.compile(
+        r"(?:股东|董监高|控股股东|实际控制人).{0,16}"
+        r"(?:拟|计划|将|实施|完成)?.{0,8}(?:出售|卖出|转让).{0,8}(?:股份|股票)"
+    ),
+    re.compile(
+        r"(?:公司|企业|发行人|上市公司|控股股东|实际控制人|董监高).{0,20}"
+        r"(?:涉嫌|被认定|存在).{0,8}(?:违法|违规)"
+    ),
+    re.compile(
+        r"\b(?:trading suspension|trading resumed|regulatory inquiry|warning letter|"
+        r"disciplinary action|public censure|administrative penalty|formal investigation|"
+        r"earnings (?:forecast|warning|preview|report)|profit warning|annual report|"
+        r"interim report|quarterly report|shareholder (?:reduction|sale plan)|"
+        r"delisting risk warning)\b",
+        re.IGNORECASE,
+    ),
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?；;\n])|(?<=\.)\s+(?=[A-Z])")
 _REPORT_PERIOD_PATTERNS = (
     re.compile(r"((?:19|20)\d{2})年(年度|半年度|第一季度|一季度|第三季度|三季度)"),
     re.compile(r"((?:19|20)\d{2})年度"),
+)
+_USER_VISIBLE_NARRATIVE_FIELDS = (
+    "trend_analysis",
+    "short_term_outlook",
+    "medium_term_outlook",
+    "technical_analysis",
+    "ma_analysis",
+    "volume_analysis",
+    "pattern_analysis",
+    "fundamental_analysis",
+    "sector_position",
+    "company_highlights",
+    "news_summary",
+    "market_sentiment",
+    "hot_topics",
+    "analysis_summary",
+    "key_points",
+    "risk_warning",
+    "buy_reason",
 )
 
 
@@ -402,17 +461,7 @@ def apply_official_hard_event_guardrail(
         else "硬事件事实仅以正式交易所核验章节为准。"
     )
 
-    for field_name in (
-        "news_summary",
-        "risk_warning",
-        "fundamental_analysis",
-        "company_highlights",
-        "analysis_summary",
-        "key_points",
-        "buy_reason",
-        "short_term_outlook",
-        "medium_term_outlook",
-    ):
+    for field_name in _USER_VISIBLE_NARRATIVE_FIELDS:
         value = getattr(result, field_name, None)
         sanitized, changed = _sanitize_generated_value(value, replacement)
         if changed:
@@ -608,4 +657,6 @@ def _sanitize_generated_value(value: Any, replacement: str) -> Tuple[Any, bool]:
 
 
 def _contains_hard_event_term(value: str) -> bool:
-    return any(term in value for term in _HARD_EVENT_TERMS)
+    return any(term in value for term in _HARD_EVENT_TERMS) or any(
+        pattern.search(value) for pattern in _HARD_EVENT_PATTERNS
+    )
