@@ -1013,13 +1013,22 @@ class StockAnalysisPipeline:
         if realtime_quote and trend_result and trend_result.ma5 > 0:
             price = getattr(realtime_quote, 'price', None)
             if price is not None and price > 0:
-                yesterday_close = None
-                if enhanced.get('yesterday') and isinstance(enhanced['yesterday'], dict):
-                    yesterday_close = enhanced['yesterday'].get('close')
                 orig_today = enhanced.get('today') or {}
                 market_today = get_market_now(
                     get_market_for_stock(normalize_stock_code(enhanced.get('code', '')))
                 ).date().isoformat()
+                previous_session_bar = enhanced.get('yesterday')
+                orig_today_date = self._coerce_daily_market_context_date(
+                    orig_today.get('date') if isinstance(orig_today, dict) else None
+                )
+                market_today_date = date.fromisoformat(market_today)
+                if orig_today_date is not None and orig_today_date < market_today_date:
+                    # 日线源尚未包含当日时，orig_today 才是上一交易日；继续使用
+                    # enhanced['yesterday'] 会跳过一天，污染涨跌幅和成交量比较。
+                    previous_session_bar = orig_today
+                yesterday_close = None
+                if isinstance(previous_session_bar, dict):
+                    yesterday_close = previous_session_bar.get('close')
                 source = getattr(realtime_quote, 'source', None)
                 source_name = getattr(source, 'value', source)
                 source_name = str(source_name) if source_name is not None else 'unknown'
@@ -1095,10 +1104,8 @@ class StockAnalysisPipeline:
                             )
                     except (TypeError, ValueError):
                         pass
-                if vol is not None and enhanced.get('yesterday'):
-                    yest_vol = enhanced['yesterday'].get('volume') if isinstance(
-                        enhanced['yesterday'], dict
-                    ) else None
+                if vol is not None and isinstance(previous_session_bar, dict):
+                    yest_vol = previous_session_bar.get('volume')
                     if yest_vol is not None:
                         try:
                             yv = float(yest_vol)

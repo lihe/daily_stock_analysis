@@ -283,6 +283,57 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
 
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
+    def test_realtime_comparison_uses_latest_history_when_today_is_previous_session(
+        self, _mock_market, mock_now
+    ) -> None:
+        today = date.today()
+        previous_session = today - timedelta(days=1)
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 16, 0, tzinfo=timezone.utc
+        )
+        context = {
+            "code": "002793",
+            "date": previous_session.isoformat(),
+            "today": {
+                "close": 5.12,
+                "volume": 48_057_800,
+                "date": previous_session.isoformat(),
+            },
+            "yesterday": {
+                "close": 4.65,
+                "volume": 24_380_000,
+                "date": (today - timedelta(days=2)).isoformat(),
+            },
+        }
+        quote = UnifiedRealtimeQuote(
+            code="002793",
+            name="罗欣药业",
+            source=RealtimeSource.TENCENT,
+            price=5.08,
+            open_price=5.05,
+            high=5.12,
+            low=5.00,
+            volume=78_657_100,
+            amount=397_000_000,
+            change_pct=-0.78,
+        )
+        trend = TrendAnalysisResult(
+            code="002793",
+            trend_status=TrendStatus.BEAR,
+            ma5=4.804,
+            ma10=4.819,
+            ma20=4.7415,
+        )
+
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "罗欣药业"
+        )
+
+        self.assertEqual(enhanced["volume_change_ratio"], 1.64)
+        self.assertEqual(enhanced["price_change_ratio"], -0.78)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
     def test_realtime_metadata_and_partial_estimated_fields_are_propagated(
         self, _mock_market, mock_now
     ) -> None:
