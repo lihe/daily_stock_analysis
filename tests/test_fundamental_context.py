@@ -55,6 +55,8 @@ class _TushareCapabilityFetcher:
 
     def get_fundamental_bundle(self, _stock_code: str, timeout_seconds: float):
         self.bundle_timeouts.append(timeout_seconds)
+        if callable(self.bundle):
+            return self.bundle(timeout_seconds)
         if isinstance(self.bundle, Exception):
             raise self.bundle
         return self.bundle
@@ -290,6 +292,56 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertAlmostEqual(tushare.bundle_timeouts[0], 1.8)
         self.assertAlmostEqual(wrapper_timeouts[0][1], 1.8)
         self.assertAlmostEqual(wrapper_timeouts[1][1], 2.5)
+
+    def test_fundamental_bundle_retry_passes_decreasing_preferred_deadline_remainder(self) -> None:
+        clock = {"now": 50.0}
+        calls = {"count": 0}
+        complete_bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 1.0},
+            "earnings": {"financial_report": {"revenue": 2.0}},
+            "institution": {"top10_holder_change": 0.0},
+            "source_chain": ["tushare.fina_indicator"],
+            "errors": [],
+        }
+
+        def bundle_result(_timeout_seconds):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("retryable")
+            return complete_bundle
+
+        tushare = _TushareCapabilityFetcher(bundle=bundle_result)
+        manager = DataFetcherManager(fetchers=[tushare])
+        wrapper_timeouts = []
+
+        def run_with_timeout(task, timeout_seconds, task_name):
+            wrapper_timeouts.append((task_name, timeout_seconds))
+            try:
+                result, err = task(), None
+            except RuntimeError as exc:
+                result, err = None, str(exc)
+            clock["now"] += 0.6
+            return result, err, 600
+
+        cfg = _manager_config()
+        cfg.fundamental_retry_max = 2
+        quote = SimpleNamespace(pe_ratio=10.0, pb_ratio=1.0, total_mv=1.0, circ_mv=1.0)
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.base.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(manager, "_run_with_timeout", side_effect=run_with_timeout), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle") as ak_call, \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=3.0, realtime_quote=quote)
+
+        self.assertEqual(ctx["growth"]["data"]["revenue_yoy"], 1.0)
+        self.assertEqual(len(tushare.bundle_timeouts), 2)
+        self.assertAlmostEqual(tushare.bundle_timeouts[0], 1.8)
+        self.assertAlmostEqual(tushare.bundle_timeouts[1], 1.2)
+        self.assertAlmostEqual(wrapper_timeouts[1][1], 1.2)
+        ak_call.assert_not_called()
 
     def test_offshore_market_returns_not_supported_when_adapter_empty(self) -> None:
         """When yfinance adapter has no data, offshore (US/HK) status is not_supported.

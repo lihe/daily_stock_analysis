@@ -2762,7 +2762,12 @@ class DataFetcherManager:
             return True
         preferred_fields = ("net_mf_amount", "net_mf_amount_5d", "net_mf_amount_10d")
         if any(field in payload for field in preferred_fields):
-            return any(cls._is_fundamental_missing(payload.get(field)) for field in preferred_fields)
+            akshare_fields = ("main_net_inflow", "inflow_5d", "inflow_10d")
+            # 两套字段口径不同：Tushare 数值齐全也不能替代既有 AkShare 主力字段。
+            return (
+                any(cls._is_fundamental_missing(payload.get(field)) for field in preferred_fields)
+                or any(cls._is_fundamental_missing(payload.get(field)) for field in akshare_fields)
+            )
         return cls._contains_fundamental_missing(payload)
 
     def _get_tushare_capability_fetcher(self, capability: str) -> Optional[BaseFetcher]:
@@ -2778,9 +2783,11 @@ class DataFetcherManager:
         err: Optional[str],
         provider: str,
         duration_ms: int,
+        attempted: bool,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
         status = str(payload.get("status", "partial")) if isinstance(payload, dict) else "failed"
-        source_chain = self._normalize_source_chain(
+        # worker pool 拒绝调度时并未进入 provider，不能把调度失败伪装成来源尝试。
+        source_chain = [] if not attempted else self._normalize_source_chain(
             payload.get("source_chain", []) if isinstance(payload, dict) else None,
             provider,
             status,
@@ -2790,6 +2797,12 @@ class DataFetcherManager:
         if err:
             errors.append(err)
         return source_chain, errors
+
+    @staticmethod
+    def _capability_task_attempted(payload: Any, err: Optional[str]) -> bool:
+        if payload is not None:
+            return True
+        return "timeout worker pool exhausted" not in str(err or "")
 
     def _get_ordered_fundamental_bundle(
         self,
@@ -2809,18 +2822,31 @@ class DataFetcherManager:
         tushare = self._get_tushare_capability_fetcher("get_fundamental_bundle")
         if tushare is not None and total_budget > 0:
             preferred_budget = min(1.8, total_budget * 0.6)
-            payload, err, cost_ms = self._run_with_retry(
-                lambda: self._call_fetcher_method(
+            preferred_deadline = time.monotonic() + preferred_budget
+
+            def fetch_tushare_bundle() -> Any:
+                # retry 也只能拿首选 deadline 的实时余量，不能重新获得完整 1.8 秒。
+                adapter_timeout = max(0.0, preferred_deadline - time.monotonic())
+                if adapter_timeout <= 0:
+                    raise DataFetchError("tushare fundamental preferred deadline exhausted")
+                return self._call_fetcher_method(
                     tushare,
                     "get_fundamental_bundle",
                     stock_code,
-                    preferred_budget,
-                ),
+                    adapter_timeout,
+                )
+
+            payload, err, cost_ms = self._run_with_retry(
+                fetch_tushare_bundle,
                 preferred_budget,
                 "tushare_fundamental_bundle",
             )
             chain, attempt_errors = self._collect_capability_attempt(
-                payload, err, "tushare_fundamental_bundle", cost_ms
+                payload,
+                err,
+                "tushare_fundamental_bundle",
+                cost_ms,
+                self._capability_task_attempted(payload, err),
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
@@ -2839,7 +2865,11 @@ class DataFetcherManager:
                 "akshare_fundamental_bundle",
             )
             chain, attempt_errors = self._collect_capability_attempt(
-                payload, err, "akshare_fundamental_bundle", cost_ms
+                payload,
+                err,
+                "akshare_fundamental_bundle",
+                cost_ms,
+                self._capability_task_attempted(payload, err),
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
@@ -2880,19 +2910,31 @@ class DataFetcherManager:
         tushare = self._get_tushare_capability_fetcher("get_capital_flow")
         if tushare is not None and total_budget > 0:
             preferred_budget = min(1.8, total_budget * 0.6)
-            payload, err, cost_ms = self._run_with_retry(
-                lambda: self._call_fetcher_method(
+            preferred_deadline = time.monotonic() + preferred_budget
+
+            def fetch_tushare_capital_flow() -> Any:
+                adapter_timeout = max(0.0, preferred_deadline - time.monotonic())
+                if adapter_timeout <= 0:
+                    raise DataFetchError("tushare capital-flow preferred deadline exhausted")
+                return self._call_fetcher_method(
                     tushare,
                     "get_capital_flow",
                     stock_code,
-                    preferred_budget,
+                    adapter_timeout,
                     top_n=5,
-                ),
+                )
+
+            payload, err, cost_ms = self._run_with_retry(
+                fetch_tushare_capital_flow,
                 preferred_budget,
                 "tushare_capital_flow",
             )
             chain, attempt_errors = self._collect_capability_attempt(
-                payload, err, "tushare_capital_flow", cost_ms
+                payload,
+                err,
+                "tushare_capital_flow",
+                cost_ms,
+                self._capability_task_attempted(payload, err),
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
@@ -2914,7 +2956,11 @@ class DataFetcherManager:
                 "akshare_capital_flow",
             )
             chain, attempt_errors = self._collect_capability_attempt(
-                payload, err, "akshare_capital_flow", cost_ms
+                payload,
+                err,
+                "akshare_capital_flow",
+                cost_ms,
+                self._capability_task_attempted(payload, err),
             )
             source_chain.extend(chain)
             errors.extend(attempt_errors)
@@ -3398,17 +3444,16 @@ class DataFetcherManager:
             bundle_status = str(bundle_payload.get("status", "not_supported"))
             bundle_errors = []
 
-        bundle_chain = self._normalize_source_chain(
-            bundle_payload.get("source_chain", []),
-            "fundamental_bundle",
-            bundle_status,
-            bundle_ms,
-        ) if isinstance(bundle_payload, dict) else self._normalize_source_chain(
-            None,
-            "fundamental_bundle",
-            bundle_status,
-            bundle_ms,
-        )
+        if not is_etf and isinstance(bundle_payload, dict) and "source_chain" in bundle_payload:
+            # ordered helper 已区分“已尝试”与“未调度”，这里不能再次补造默认 provider。
+            bundle_chain = list(bundle_payload.get("source_chain", []))
+        else:
+            bundle_chain = self._normalize_source_chain(
+                bundle_payload.get("source_chain", []) if isinstance(bundle_payload, dict) else None,
+                "fundamental_bundle",
+                bundle_status,
+                bundle_ms,
+            )
         growth_payload = bundle_payload.get("growth", {}) if isinstance(bundle_payload, dict) else {}
         earnings_payload = bundle_payload.get("earnings", {}) if isinstance(bundle_payload, dict) else {}
         institution_payload = bundle_payload.get("institution", {}) if isinstance(bundle_payload, dict) else {}
@@ -3589,12 +3634,8 @@ class DataFetcherManager:
                 "stock_flow": payload.get("stock_flow", {}),
                 "sector_rankings": payload.get("sector_rankings", {}),
             },
-            self._normalize_source_chain(
-                payload.get("source_chain", []),
-                "capital_flow",
-                capital_flow_status,
-                cost_ms,
-            ),
+            # ordered helper 的 source_chain 已包含真实 attempted 判定，空列表必须原样保留。
+            list(payload.get("source_chain", [])),
             list(payload.get("errors", [])) + ([err] if err else []),
         )
 

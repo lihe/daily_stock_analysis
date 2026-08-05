@@ -6,6 +6,7 @@ Contract tests for get_capital_flow tool output semantics.
 import os
 import sys
 import unittest
+from threading import BoundedSemaphore
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -184,7 +185,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertEqual(ctx["data"]["sector_rankings"]["top"][0]["name"], "白酒")
         self.assertAlmostEqual(wrapper_timeouts[1][1], 1.1)
 
-    def test_complete_tushare_stock_flow_can_fill_only_missing_sector_rankings(self) -> None:
+    def test_complete_tushare_net_mf_fields_still_fill_akshare_main_flow_fields(self) -> None:
         tushare = _TushareCapabilityFetcher(capital_flow={
             "status": "partial",
             "stock_flow": {
@@ -194,8 +195,11 @@ class TestGetCapitalFlowContract(unittest.TestCase):
                 "net_mf_amount_10d": 3.0,
                 "amount_unit": "万元",
             },
-            "sector_rankings": {"top": [], "bottom": []},
-            "source_chain": ["tushare.moneyflow"],
+            "sector_rankings": {
+                "top": [{"name": "半导体", "net_amount": 5.0, "amount_unit": "亿元"}],
+                "bottom": [],
+            },
+            "source_chain": ["tushare.moneyflow", "tushare.moneyflow_ind_ths"],
             "errors": [],
         })
         manager = DataFetcherManager(fetchers=[tushare])
@@ -211,11 +215,38 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         }
         cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
         with patch("src.config.get_config", return_value=cfg), \
-                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_payload):
+                patch.object(manager._fundamental_adapter, "get_capital_flow", return_value=ak_payload) as ak_call:
             ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
 
-        self.assertEqual(ctx["data"]["stock_flow"], tushare.capital_flow["stock_flow"])
-        self.assertEqual(ctx["data"]["sector_rankings"], ak_payload["sector_rankings"])
+        self.assertEqual(ctx["data"]["stock_flow"]["net_mf_amount"], 1.0)
+        self.assertEqual(ctx["data"]["stock_flow"]["main_net_inflow"], 99.0)
+        self.assertEqual(ctx["data"]["sector_rankings"], tushare.capital_flow["sector_rankings"])
+        ak_call.assert_called_once_with("600519")
+
+    def test_worker_pool_exhaustion_records_errors_without_unstarted_providers(self) -> None:
+        tushare = _TushareCapabilityFetcher(capital_flow={
+            "status": "partial",
+            "stock_flow": {"net_mf_amount": 1.0},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": ["tushare.moneyflow"],
+            "errors": [],
+        })
+        manager = DataFetcherManager(fetchers=[tushare])
+        manager._fundamental_timeout_slots = BoundedSemaphore(1)
+        self.assertTrue(manager._fundamental_timeout_slots.acquire(blocking=False))
+        cfg = SimpleNamespace(fundamental_fetch_timeout_seconds=3.0, fundamental_retry_max=1)
+        try:
+            with patch("src.config.get_config", return_value=cfg):
+                ctx = manager.get_capital_flow_context("600519", budget_seconds=3.0)
+        finally:
+            manager._fundamental_timeout_slots.release()
+
+        providers = [item["provider"] for item in ctx["source_chain"]]
+        self.assertNotIn("tushare_capital_flow", providers)
+        self.assertNotIn("akshare_capital_flow", providers)
+        self.assertEqual(tushare.capital_flow_timeouts, [])
+        self.assertTrue(ctx["errors"])
+        self.assertTrue(all("worker pool exhausted" in error for error in ctx["errors"]))
 
     def test_capital_flow_zero_deadline_remainder_skips_akshare_and_fails_open(self) -> None:
         clock = {"now": 20.0}
