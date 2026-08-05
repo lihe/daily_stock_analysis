@@ -200,6 +200,11 @@ def test_pipeline_warns_once_when_all_realtime_sources_fail(caplog):
     assert result is None
     pipeline.fetcher_manager.get_stock_name.assert_called_once_with("600519", allow_realtime=False)
     pipeline.fetcher_manager.get_realtime_quote.assert_called_once_with("600519", log_final_failure=False)
+    pipeline.fetcher_manager.get_fundamental_context.assert_called_once_with(
+        "600519",
+        budget_seconds=1.5,
+        realtime_quote=None,
+    )
     downgrade_logs = [
         record.message
         for record in caplog.records
@@ -214,11 +219,11 @@ def test_pipeline_passes_primary_quote_to_fundamental_context():
 
     pipeline.analyze_stock("600519", ReportType.SIMPLE, "q-reuse")
 
-    pipeline.fetcher_manager.get_fundamental_context.assert_called_once_with(
-        "600519",
-        budget_seconds=1.5,
-        realtime_quote=quote,
-    )
+    pipeline.fetcher_manager.get_fundamental_context.assert_called_once()
+    args, kwargs = pipeline.fetcher_manager.get_fundamental_context.call_args
+    assert args == ("600519",)
+    assert kwargs["budget_seconds"] == 1.5
+    assert kwargs["realtime_quote"] is quote
 
 
 @patch("src.config.get_config")
@@ -258,6 +263,11 @@ def test_pipeline_logs_disabled_realtime_once_without_fetching_quote(caplog):
     assert result is None
     pipeline.fetcher_manager.get_stock_name.assert_called_once_with("600519", allow_realtime=False)
     pipeline.fetcher_manager.get_realtime_quote.assert_not_called()
+    pipeline.fetcher_manager.get_fundamental_context.assert_called_once_with(
+        "600519",
+        budget_seconds=1.5,
+        realtime_quote=None,
+    )
     downgrade_logs = [
         record.message
         for record in caplog.records
