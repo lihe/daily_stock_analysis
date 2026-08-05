@@ -304,3 +304,52 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
             start_date="20260101",
             end_date="20260105",
         )
+
+    def test_quota_wait_does_not_hold_rate_lock_or_shared_api_slots(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher.rate_limit_per_minute = 1
+        fetcher._minute_start = 1000.0
+        fetcher._call_count = 1
+        fetcher._api.stock_basic.return_value = pd.DataFrame({"name": ["测试股票"]})
+
+        clock = {"now": 1000.0}
+        clock_lock = threading.Lock()
+        sleep_started = threading.Event()
+        release_sleep = threading.Event()
+
+        def fake_time() -> float:
+            with clock_lock:
+                return clock["now"]
+
+        def fake_sleep(seconds: float) -> None:
+            sleep_started.set()
+            release_sleep.wait(timeout=1.0)
+            with clock_lock:
+                clock["now"] += seconds
+
+        with patch("data_provider.tushare_fetcher.time.time", side_effect=fake_time), patch(
+            "data_provider.tushare_fetcher.time.sleep",
+            side_effect=fake_sleep,
+        ):
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [
+                    executor.submit(fetcher.get_stock_name, stock_code)
+                    for stock_code in ("600519", "600000", "601318", "603288")
+                ]
+                self.assertTrue(sleep_started.wait(timeout=0.5))
+                threading.Event().wait(0.05)
+
+                rate_lock_available = fetcher._rate_limit_lock.acquire(blocking=False)
+                if rate_lock_available:
+                    fetcher._rate_limit_lock.release()
+                api_slot_available = fetcher._api_slots.acquire(blocking=False)
+                if api_slot_available:
+                    fetcher._api_slots.release()
+
+                release_sleep.set()
+                results = [future.result(timeout=1.0) for future in futures]
+
+        self.assertTrue(rate_lock_available)
+        self.assertTrue(api_slot_available)
+        self.assertEqual(results, ["测试股票"] * 4)
+        self.assertEqual(fetcher._api.stock_basic.call_count, 4)

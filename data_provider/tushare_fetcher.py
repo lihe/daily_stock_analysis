@@ -254,31 +254,41 @@ class TushareFetcher(BaseFetcher):
         2. 如果是，重置计数器
         3. 如果当前分钟调用次数超过限制，强制休眠
         """
-        # 计数周期的检查、重置和递增必须原子化，否则并发适配器会丢计数。
-        with self._rate_limit_lock:
-            current_time = time.time()
+        while True:
+            # 锁内只做周期更新和名额预留，等待必须放在锁外，避免阻塞其他调用检查状态。
+            counter_reset = False
+            reserved_count: Optional[int] = None
+            with self._rate_limit_lock:
+                current_time = time.time()
+                if self._minute_start is None:
+                    self._minute_start = current_time
+                    self._call_count = 0
+                elif current_time - self._minute_start >= 60:
+                    self._minute_start = current_time
+                    self._call_count = 0
+                    counter_reset = True
 
-            if self._minute_start is None:
-                self._minute_start = current_time
-                self._call_count = 0
-            elif current_time - self._minute_start >= 60:
-                self._minute_start = current_time
-                self._call_count = 0
+                if self._call_count < self.rate_limit_per_minute:
+                    self._call_count += 1
+                    reserved_count = self._call_count
+                else:
+                    elapsed = current_time - self._minute_start
+                    sleep_time = max(0, 60 - elapsed) + 1
+                    call_count = self._call_count
+
+            if counter_reset:
                 logger.debug("速率限制计数器已重置")
-
-            if self._call_count >= self.rate_limit_per_minute:
-                elapsed = current_time - self._minute_start
-                sleep_time = max(0, 60 - elapsed) + 1
-                logger.warning(
-                    f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
-                    f"等待 {sleep_time:.1f} 秒..."
+            if reserved_count is not None:
+                logger.debug(
+                    f"Tushare 当前分钟调用次数: {reserved_count}/{self.rate_limit_per_minute}"
                 )
-                time.sleep(sleep_time)
-                self._minute_start = time.time()
-                self._call_count = 0
+                return
 
-            self._call_count += 1
-            logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
+            logger.warning(
+                f"Tushare 达到速率限制 ({call_count}/{self.rate_limit_per_minute} 次/分钟)，"
+                f"等待 {sleep_time:.1f} 秒..."
+            )
+            time.sleep(sleep_time)
 
     def _call_api_with_rate_limit(
         self,
@@ -292,11 +302,12 @@ class TushareFetcher(BaseFetcher):
         if target is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
 
+        # 先拿到分钟配额，再占用网络并发槽；限流 sleep 不应耗尽四个 API slot。
+        self._check_rate_limit()
         acquired = self._api_slots.acquire(timeout=30.0)
         if not acquired:
             raise RateLimitError("Tushare API 并发槽等待超时")
         try:
-            self._check_rate_limit()
             method = getattr(target, method_name)
             return method(*args, **kwargs)
         finally:

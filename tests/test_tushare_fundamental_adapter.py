@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -199,6 +200,121 @@ def test_missing_report_type_and_dividend_status_fail_closed() -> None:
     assert result["earnings"] == {}
     assert "financial_report" not in result["earnings"]
     assert "dividend" not in result["earnings"]
+
+
+def test_financial_report_rejects_missing_nan_or_invalid_end_dates() -> None:
+    invalid_anchor_rows = (
+        {"ann_date": "20260420", "report_type": "1", "tr_yoy": 99.0},
+        {"end_date": None, "ann_date": "20260420", "report_type": "1", "tr_yoy": 99.0},
+        {"end_date": "not-a-date", "ann_date": "20260420", "report_type": "1", "tr_yoy": 99.0},
+    )
+    for anchor_row in invalid_anchor_rows:
+        adapter = TushareFundamentalAdapter(
+            lambda api_name, **_: (
+                pd.DataFrame([anchor_row]) if api_name == "fina_indicator" else pd.DataFrame()
+            )
+        )
+
+        result = adapter.get_fundamental_bundle("600519", timeout_seconds=1.0)
+
+        assert result["growth"] == {}
+        assert "financial_report" not in result["earnings"]
+
+    indicator = pd.DataFrame(
+        [{"end_date": "20260331", "ann_date": "20260420", "report_type": "1", "roe": 10.0}]
+    )
+    invalid_income_frames = (
+        pd.DataFrame([{"ann_date": "20260421", "report_type": "1", "total_revenue": 999.0}]),
+        pd.DataFrame(
+            [{"end_date": None, "ann_date": "20260421", "report_type": "1", "total_revenue": 999.0}]
+        ),
+        pd.DataFrame(
+            [
+                {
+                    "end_date": "not-a-date",
+                    "ann_date": "20260421",
+                    "report_type": "1",
+                    "total_revenue": 999.0,
+                }
+            ]
+        ),
+    )
+    for income in invalid_income_frames:
+        frames = {"fina_indicator": indicator, "income": income}
+        adapter = TushareFundamentalAdapter(
+            lambda api_name, **_: frames.get(api_name, pd.DataFrame())
+        )
+
+        report = adapter.get_fundamental_bundle(
+            "600519", timeout_seconds=1.0
+        )["earnings"]["financial_report"]
+
+        assert report["report_date"] == "2026-03-31"
+        assert report["revenue"] is None
+
+
+def test_shanghai_injected_now_controls_visibility_dividend_window_and_top10_snapshot() -> None:
+    shanghai_now = datetime(2026, 8, 7, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    frames = {
+        "fina_indicator": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260630",
+                    "ann_date": "20260807",
+                    "report_type": "1",
+                    "tr_yoy": 12.0,
+                }
+            ]
+        ),
+        "dividend": pd.DataFrame(
+            [
+                {
+                    "ann_date": "20250807",
+                    "div_proc": "实施",
+                    "ex_date": "20250807",
+                    "cash_div_tax": 0.3,
+                },
+                {
+                    "ann_date": "20250806",
+                    "div_proc": "实施",
+                    "ex_date": "20250806",
+                    "cash_div_tax": 0.5,
+                },
+            ]
+        ),
+        "top10_holders": pd.DataFrame(
+            [
+                {
+                    "end_date": "20260331",
+                    "ann_date": "20260807",
+                    "holder_name": "可见股东",
+                    "hold_amount": 100.0,
+                },
+                {
+                    "end_date": "20260630",
+                    "ann_date": "20260808",
+                    "holder_name": "未来股东",
+                    "hold_amount": 200.0,
+                },
+            ]
+        ),
+    }
+    adapter = TushareFundamentalAdapter(
+        lambda api_name, **_: frames.get(api_name, pd.DataFrame()),
+        now_provider=lambda: shanghai_now,
+    )
+
+    result = adapter.get_fundamental_bundle("600519", timeout_seconds=1.0)
+
+    assert result["growth"]["revenue_yoy"] == 12.0
+    dividend = result["earnings"]["dividend"]
+    assert dividend["as_of"] == "2026-08-07"
+    assert dividend["ttm_event_count"] == 1
+    assert dividend["events"][0]["event_date"] == "2025-08-07"
+    snapshot = result["institution"]["top10_holder_snapshot"]
+    assert snapshot["report_date"] == "2026-03-31"
+    assert snapshot["announcement_date"] == "2026-08-07"
+    assert snapshot["holders"][0]["holder_name"] == "可见股东"
 
 
 def test_growth_uses_single_quarter_fields_only_when_cumulative_fields_are_missing() -> None:

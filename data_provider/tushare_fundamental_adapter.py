@@ -12,6 +12,7 @@ import pandas as pd
 
 
 ApiCallback = Callable[..., pd.DataFrame]
+NowProvider = Callable[[], datetime]
 
 _ETF_PREFIXES = ("15", "16", "18", "51", "52", "56", "58")
 _CN_STOCK_EXCHANGES = {
@@ -114,8 +115,11 @@ def _announcement_value(row: pd.Series) -> Any:
 
 def _select_report_row(
     df: Optional[pd.DataFrame],
+    *,
+    visible_date: date,
     end_date: Optional[str] = None,
     require_report_type: bool = False,
+    require_end_date: bool = False,
 ) -> Optional[pd.Series]:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return None
@@ -125,35 +129,45 @@ def _select_report_row(
         return None
     if "report_type" in work.columns:
         work = work[work["report_type"].astype(str).str.strip() == "1"]
-    if end_date is not None and "end_date" in work.columns:
-        work = work[work["end_date"].astype(str) == str(end_date)]
+    if (require_end_date or end_date is not None) and "end_date" not in work.columns:
+        return None
+    if "end_date" in work.columns:
+        work["__end_date"] = pd.to_datetime(work["end_date"], errors="coerce")
+        if require_end_date:
+            work = work[work["__end_date"].notna()]
+    else:
+        work["__end_date"] = pd.NaT
+    if end_date is not None:
+        target_end_date = pd.to_datetime(end_date, errors="coerce")
+        if pd.isna(target_end_date):
+            return None
+        work = work[work["__end_date"] == target_end_date]
     if work.empty:
         return None
 
     work["__announcement"] = work.apply(_announcement_value, axis=1)
     announcement_ts = pd.to_datetime(work["__announcement"], errors="coerce")
     # 未来才公开的修订不能泄漏进当前分析结果。
-    work = work[announcement_ts.dt.date <= date.today()]
+    work = work[announcement_ts.dt.date <= visible_date]
     if work.empty:
         return None
 
-    work["__end_date"] = pd.to_datetime(work.get("end_date"), errors="coerce")
     work["__announcement_ts"] = pd.to_datetime(work["__announcement"], errors="coerce")
     work = work.sort_values(["__end_date", "__announcement_ts"], ascending=[False, False], na_position="last")
     return work.iloc[0]
 
 
-def _build_dividend_payload(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+def _build_dividend_payload(df: Optional[pd.DataFrame], visible_date: date) -> Dict[str, Any]:
     if not isinstance(df, pd.DataFrame) or df.empty or "div_proc" not in df.columns:
         return {}
 
-    cutoff = date.today() - timedelta(days=365)
+    cutoff = visible_date - timedelta(days=365)
     events = []
     for _, row in df.iterrows():
         if _safe_str(row.get("div_proc")) != "实施":
             continue
         ex_date = pd.to_datetime(row.get("ex_date"), errors="coerce")
-        if pd.isna(ex_date) or not cutoff <= ex_date.date() <= date.today():
+        if pd.isna(ex_date) or not cutoff <= ex_date.date() <= visible_date:
             continue
         cash_div_tax = _safe_float(row.get("cash_div_tax"))
         if cash_div_tax is None or cash_div_tax <= 0:
@@ -182,11 +196,11 @@ def _build_dividend_payload(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
         "coverage": "implemented_cash_dividend_pre_tax_365d",
         "currency": "CNY",
         "amount_unit": "yuan_per_share",
-        "as_of": date.today().isoformat(),
+        "as_of": visible_date.isoformat(),
     }
 
 
-def _build_top10_snapshot(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+def _build_top10_snapshot(df: Optional[pd.DataFrame], visible_date: date) -> Dict[str, Any]:
     if not isinstance(df, pd.DataFrame) or df.empty or "end_date" not in df.columns:
         return {}
 
@@ -194,7 +208,7 @@ def _build_top10_snapshot(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
     work["__end_date"] = pd.to_datetime(work["end_date"], errors="coerce")
     work["__announcement"] = work.apply(_announcement_value, axis=1)
     work["__announcement_ts"] = pd.to_datetime(work["__announcement"], errors="coerce")
-    work = work[work["__announcement_ts"].dt.date <= date.today()]
+    work = work[work["__announcement_ts"].dt.date <= visible_date]
     if work.empty:
         return {}
     latest_end = work["__end_date"].max()
@@ -240,8 +254,22 @@ class TushareFundamentalAdapter:
         "top10_holders",
     )
 
-    def __init__(self, api_callback: ApiCallback) -> None:
+    def __init__(
+        self,
+        api_callback: ApiCallback,
+        now_provider: Optional[NowProvider] = None,
+    ) -> None:
         self._api_callback = api_callback
+        self._now_provider = now_provider or (
+            lambda: datetime.now(ZoneInfo("Asia/Shanghai"))
+        )
+
+    def _shanghai_now(self) -> datetime:
+        now = self._now_provider()
+        zone = ZoneInfo("Asia/Shanghai")
+        if now.tzinfo is None:
+            return now.replace(tzinfo=zone)
+        return now.astimezone(zone)
 
     def _run_endpoints(
         self,
@@ -288,6 +316,7 @@ class TushareFundamentalAdapter:
             max_workers=4,
             thread_name_prefix="tushare-fundamental",
         )
+        visible_date = self._shanghai_now().date()
 
         result = _empty_fundamental_bundle()
         result["source_chain"] = [f"tushare.{api_name}" for api_name in attempted]
@@ -295,24 +324,30 @@ class TushareFundamentalAdapter:
 
         indicator_row = _select_report_row(
             frames.get("fina_indicator"),
+            visible_date=visible_date,
             require_report_type=True,
+            require_end_date=True,
         )
         if indicator_row is None:
             income_anchor = _select_report_row(
                 frames.get("income"),
+                visible_date=visible_date,
                 require_report_type=True,
+                require_end_date=True,
             )
-            target_end_date = str(income_anchor.get("end_date")) if income_anchor is not None else None
+            target_end_date = _iso_date(income_anchor.get("end_date")) if income_anchor is not None else None
         else:
-            target_end_date = str(indicator_row.get("end_date"))
+            target_end_date = _iso_date(indicator_row.get("end_date"))
         income_row = _select_report_row(
             frames.get("income"),
-            target_end_date,
+            visible_date=visible_date,
+            end_date=target_end_date,
             require_report_type=True,
         )
         cashflow_row = _select_report_row(
             frames.get("cashflow"),
-            target_end_date,
+            visible_date=visible_date,
+            end_date=target_end_date,
             require_report_type=True,
         )
 
@@ -365,7 +400,10 @@ class TushareFundamentalAdapter:
             }
             result["earnings"]["financial_report"] = financial_report
 
-        forecast_row = _select_report_row(frames.get("forecast"))
+        forecast_row = _select_report_row(
+            frames.get("forecast"),
+            visible_date=visible_date,
+        )
         if forecast_row is not None:
             forecast = {
                 "report_date": _iso_date(forecast_row.get("end_date")),
@@ -379,7 +417,10 @@ class TushareFundamentalAdapter:
             result["earnings"]["forecast"] = forecast
             result["earnings"]["forecast_summary"] = forecast["summary"]
 
-        express_row = _select_report_row(frames.get("express"))
+        express_row = _select_report_row(
+            frames.get("express"),
+            visible_date=visible_date,
+        )
         if express_row is not None:
             express = {
                 "report_date": _iso_date(express_row.get("end_date")),
@@ -389,11 +430,17 @@ class TushareFundamentalAdapter:
             result["earnings"]["express"] = express
             result["earnings"]["quick_report_summary"] = express["perf_summary"]
 
-        dividend_payload = _build_dividend_payload(frames.get("dividend"))
+        dividend_payload = _build_dividend_payload(
+            frames.get("dividend"),
+            visible_date,
+        )
         if dividend_payload:
             result["earnings"]["dividend"] = dividend_payload
 
-        top10_snapshot = _build_top10_snapshot(frames.get("top10_holders"))
+        top10_snapshot = _build_top10_snapshot(
+            frames.get("top10_holders"),
+            visible_date,
+        )
         if top10_snapshot:
             result["institution"]["top10_holder_snapshot"] = top10_snapshot
 
@@ -432,7 +479,7 @@ class TushareFundamentalAdapter:
             work = stock_df[["trade_date", "net_mf_amount"]].copy()
             work["__trade_date"] = pd.to_datetime(work["trade_date"], errors="coerce")
             work["net_mf_amount"] = pd.to_numeric(work["net_mf_amount"], errors="coerce")
-            china_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            china_now = self._shanghai_now()
             completed_date = china_now.date()
             if china_now.time() < datetime_time(15, 30):
                 completed_date -= timedelta(days=1)
