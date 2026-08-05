@@ -340,7 +340,7 @@ class TushareFetcher(BaseFetcher):
         china_now = self._get_china_now()
         requested_end_date = end_date or china_now.strftime("%Y%m%d")
 
-        if self.date_list is not None and self._date_list_end == requested_end_date:
+        if self.date_list and self._date_list_end == requested_end_date:
             return self.date_list
 
         # 长假前后 20 个自然日可能不足 10 个开市日，扩大窗口以满足资金流聚合。
@@ -352,16 +352,22 @@ class TushareFetcher(BaseFetcher):
             end_date=requested_end_date,
         )
 
-        if df_cal is None or df_cal.empty or "cal_date" not in df_cal.columns:
+        if (
+            df_cal is None
+            or df_cal.empty
+            or "cal_date" not in df_cal.columns
+            or "is_open" not in df_cal.columns
+        ):
             logger.warning("[Tushare] trade_cal 返回为空，无法更新交易日历缓存")
-            self.date_list = []
-            self._date_list_end = requested_end_date
-            return self.date_list
+            return []
 
         trade_dates = sorted(
             df_cal[df_cal["is_open"] == 1]["cal_date"].astype(str).tolist(),
             reverse=True,
         )
+        if not trade_dates:
+            logger.warning("[Tushare] trade_cal 未返回开市日，不更新交易日历缓存")
+            return []
         self.date_list = trade_dates
         self._date_list_end = requested_end_date
         return trade_dates

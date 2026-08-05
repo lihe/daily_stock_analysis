@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, time as datetime_time, timedelta
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -70,6 +71,14 @@ def _empty_capital_flow() -> Dict[str, Any]:
         "source_chain": [],
         "errors": [],
     }
+
+
+def _failed_capital_flow(error_type: str, source_chain: Optional[List[str]] = None) -> Dict[str, Any]:
+    result = _empty_capital_flow()
+    result["status"] = "failed"
+    result["source_chain"] = source_chain or []
+    result["errors"] = [error_type]
+    return result
 
 
 def _to_ts_code(stock_code: str) -> str:
@@ -286,13 +295,22 @@ class TushareFundamentalAdapter:
         timeout_seconds: float,
         max_workers: int,
         thread_name_prefix: str,
+        absolute_deadline: Optional[float] = None,
     ) -> Tuple[Dict[str, pd.DataFrame], List[str], List[str]]:
+        if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+            return {}, [], []
         executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
         futures = {
             executor.submit(self._api_callback, api_name, **kwargs): api_name
             for api_name, kwargs in requests.items()
         }
-        done, pending = wait(futures, timeout=max(0.0, float(timeout_seconds)))
+        wait_timeout = max(0.0, float(timeout_seconds))
+        if absolute_deadline is not None:
+            wait_timeout = min(
+                wait_timeout,
+                max(0.0, absolute_deadline - time.monotonic()),
+            )
+        done, pending = wait(futures, timeout=wait_timeout)
         frames: Dict[str, pd.DataFrame] = {}
         errors: List[str] = []
         for future in done:
@@ -315,6 +333,52 @@ class TushareFundamentalAdapter:
         attempted = [futures[future] for future in futures if not future.cancelled()]
         attempted.sort(key=endpoint_order.__getitem__)
         return frames, errors, attempted
+
+    def _resolve_completed_trade_dates(
+        self,
+        china_now: datetime,
+        absolute_deadline: float,
+    ) -> Tuple[Optional[List[str]], Optional[str]]:
+        remaining = max(0.0, absolute_deadline - time.monotonic())
+        if remaining <= 0:
+            return None, "TimeoutError"
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tushare-trade-calendar")
+        future = executor.submit(
+            self._trade_date_resolver,
+            china_now.strftime("%Y%m%d"),
+        )
+        try:
+            done, _ = wait((future,), timeout=remaining)
+            if future not in done:
+                future.cancel()
+                return None, "TimeoutError"
+            try:
+                resolved_dates = future.result()
+            except Exception as exc:
+                return None, type(exc).__name__
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        normalized_dates = set()
+        current_date = china_now.strftime("%Y%m%d")
+        for value in resolved_dates or []:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                continue
+            trade_date = parsed.strftime("%Y%m%d")
+            if trade_date > current_date:
+                continue
+            if trade_date == current_date and china_now.time() < datetime_time(19, 0):
+                continue
+            normalized_dates.add(trade_date)
+
+        if time.monotonic() >= absolute_deadline:
+            return None, "TimeoutError"
+        completed_trade_dates = sorted(normalized_dates, reverse=True)[:10]
+        if not completed_trade_dates:
+            return [], "EmptyResult"
+        return completed_trade_dates, None
 
     def get_fundamental_bundle(self, stock_code: str, timeout_seconds: float) -> Dict[str, Any]:
         if not _supported_cn_stock(stock_code):
@@ -471,29 +535,30 @@ class TushareFundamentalAdapter:
         timeout_seconds: float,
         top_n: int = 5,
     ) -> Dict[str, Any]:
+        absolute_deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         if not _supported_cn_stock(stock_code):
             return _empty_capital_flow()
         ts_code = _to_ts_code(stock_code)
         china_now = self._shanghai_now()
         current_date = china_now.strftime("%Y%m%d")
         completed_trade_dates: Optional[List[str]] = None
+        calendar_source_chain: List[str] = []
         if self._trade_date_resolver is not None:
-            resolved_dates = self._trade_date_resolver(current_date)
-            normalized_dates = set()
-            for value in resolved_dates:
-                parsed = pd.to_datetime(value, errors="coerce")
-                if pd.isna(parsed):
-                    continue
-                trade_date = parsed.strftime("%Y%m%d")
-                if trade_date > current_date:
-                    continue
-                if (
-                    trade_date == current_date
-                    and china_now.time() < datetime_time(19, 0)
-                ):
-                    continue
-                normalized_dates.add(trade_date)
-            completed_trade_dates = sorted(normalized_dates, reverse=True)[:10]
+            calendar_source_chain = ["tushare.trade_cal"]
+            completed_trade_dates, calendar_error = self._resolve_completed_trade_dates(
+                china_now,
+                absolute_deadline,
+            )
+            if calendar_error is not None:
+                return _failed_capital_flow(
+                    f"trade_calendar:{calendar_error}",
+                    calendar_source_chain,
+                )
+
+        remaining = max(0.0, absolute_deadline - time.monotonic())
+        if remaining <= 0:
+            error_name = "trade_calendar:TimeoutError" if calendar_source_chain else "capital_flow:TimeoutError"
+            return _failed_capital_flow(error_name, calendar_source_chain)
 
         moneyflow_request: Dict[str, Any] = {"ts_code": ts_code}
         sector_request: Dict[str, Any] = {}
@@ -510,13 +575,16 @@ class TushareFundamentalAdapter:
                 "moneyflow": moneyflow_request,
                 "moneyflow_ind_ths": sector_request,
             },
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=remaining,
             max_workers=2,
             thread_name_prefix="tushare-capital-flow",
+            absolute_deadline=absolute_deadline,
         )
 
         result = _empty_capital_flow()
-        result["source_chain"] = [f"tushare.{api_name}" for api_name in attempted]
+        result["source_chain"] = calendar_source_chain + [
+            f"tushare.{api_name}" for api_name in attempted
+        ]
         result["errors"] = errors
 
         stock_df = frames.get("moneyflow")
@@ -561,26 +629,23 @@ class TushareFundamentalAdapter:
         if isinstance(sector_df, pd.DataFrame) and not sector_df.empty and {
             "industry",
             "net_buy_amount",
+            "trade_date",
         }.issubset(sector_df.columns):
             work = sector_df.copy()
-            if "trade_date" in work.columns:
-                work["__trade_date"] = pd.to_datetime(work["trade_date"], errors="coerce")
-                work["__compact_trade_date"] = work["__trade_date"].dt.strftime("%Y%m%d")
-                if completed_trade_dates is not None:
-                    latest_completed = completed_trade_dates[0] if completed_trade_dates else None
-                    work = work[work["__compact_trade_date"] == latest_completed]
-                else:
-                    work = work[
-                        (work["__compact_trade_date"] < current_date)
-                        | (
-                            (work["__compact_trade_date"] == current_date)
-                            & (china_now.time() >= datetime_time(19, 0))
-                        )
-                    ]
-                    latest_trade_date = work["__trade_date"].max()
-                    work = work[work["__trade_date"] == latest_trade_date]
-            elif completed_trade_dates == []:
-                work = work.iloc[0:0]
+            work["__trade_date"] = pd.to_datetime(work["trade_date"], errors="coerce")
+            work["__compact_trade_date"] = work["__trade_date"].dt.strftime("%Y%m%d")
+            if completed_trade_dates is not None:
+                work = work[work["__compact_trade_date"] == completed_trade_dates[0]]
+            else:
+                work = work[
+                    (work["__compact_trade_date"] < current_date)
+                    | (
+                        (work["__compact_trade_date"] == current_date)
+                        & (china_now.time() >= datetime_time(19, 0))
+                    )
+                ]
+                latest_trade_date = work["__trade_date"].max()
+                work = work[work["__trade_date"] == latest_trade_date]
             work["__net_buy_amount"] = pd.to_numeric(
                 work["net_buy_amount"], errors="coerce"
             )

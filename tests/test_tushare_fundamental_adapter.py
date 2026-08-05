@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import date, datetime, timedelta
 import threading
 import time
@@ -834,6 +835,103 @@ def test_capital_flow_default_constructor_excludes_same_day_rows_before_1900() -
     ]
 
 
+def test_capital_flow_deadline_stops_after_slow_trade_calendar_resolver() -> None:
+    resolver_started = threading.Event()
+    resolver_release = threading.Event()
+    resolver_finished = threading.Event()
+    callback_calls: list[str] = []
+
+    def resolve_trade_dates(_end_date: str) -> list[str]:
+        resolver_started.set()
+        resolver_release.wait()
+        resolver_finished.set()
+        return ["20260807", "20260806"]
+
+    def callback(api_name: str, **_) -> pd.DataFrame:
+        callback_calls.append(api_name)
+        return pd.DataFrame()
+
+    adapter = TushareFundamentalAdapter(
+        callback,
+        now_provider=lambda: datetime(2026, 8, 7, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        trade_date_resolver=resolve_trade_dates,
+    )
+    returned_within_budget = True
+    result = None
+    started_at = time.monotonic()
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        future = caller.submit(adapter.get_capital_flow, "600519", 0.05)
+        assert resolver_started.wait(timeout=1.0)
+        try:
+            result = future.result(timeout=0.25)
+        except FutureTimeoutError:
+            returned_within_budget = False
+        elapsed = time.monotonic() - started_at
+        resolver_release.set()
+        assert resolver_finished.wait(timeout=1.0)
+        future.result(timeout=1.0)
+
+    assert returned_within_budget
+    assert elapsed < 0.25
+    assert callback_calls == []
+    assert result == {
+        "status": "failed",
+        "stock_flow": {},
+        "sector_rankings": {"top": [], "bottom": []},
+        "source_chain": ["tushare.trade_cal"],
+        "errors": ["trade_calendar:TimeoutError"],
+    }
+
+
+def test_capital_flow_empty_trade_calendar_fails_closed_without_endpoint_calls() -> None:
+    callback_calls: list[str] = []
+
+    def callback(api_name: str, **_) -> pd.DataFrame:
+        callback_calls.append(api_name)
+        return pd.DataFrame()
+
+    adapter = TushareFundamentalAdapter(
+        callback,
+        now_provider=lambda: datetime(2026, 8, 7, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        trade_date_resolver=lambda _end_date: [],
+    )
+
+    result = adapter.get_capital_flow("600519", timeout_seconds=1.0)
+
+    assert callback_calls == []
+    assert result == {
+        "status": "failed",
+        "stock_flow": {},
+        "sector_rankings": {"top": [], "bottom": []},
+        "source_chain": ["tushare.trade_cal"],
+        "errors": ["trade_calendar:EmptyResult"],
+    }
+
+
+def test_default_sector_rankings_require_parseable_completed_trade_date() -> None:
+    invalid_sector_frames = (
+        pd.DataFrame([{"industry": "缺日期", "net_buy_amount": 9.0}]),
+        pd.DataFrame(
+            [{"trade_date": "not-a-date", "industry": "坏日期", "net_buy_amount": 8.0}]
+        ),
+        pd.DataFrame(
+            [{"trade_date": "20260808", "industry": "未来日期", "net_buy_amount": 7.0}]
+        ),
+    )
+
+    for sector_frame in invalid_sector_frames:
+        adapter = TushareFundamentalAdapter(
+            lambda api_name, **_: (
+                sector_frame if api_name == "moneyflow_ind_ths" else pd.DataFrame()
+            ),
+            now_provider=lambda: datetime(2026, 8, 7, 18, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        result = adapter.get_capital_flow("600519", timeout_seconds=1.0)
+
+        assert result["sector_rankings"] == {"top": [], "bottom": []}
+
+
 def test_endpoint_error_is_sanitized_while_other_endpoint_data_survives() -> None:
     def callback(api_name: str, **_) -> pd.DataFrame:
         if api_name == "income":
@@ -855,42 +953,67 @@ def test_endpoint_error_is_sanitized_while_other_endpoint_data_survives() -> Non
     assert all(item.startswith("tushare.") for item in result["source_chain"])
 
 
-def test_fundamental_timeout_returns_completed_partial_without_waiting_for_running_calls() -> None:
+def test_fundamental_timeout_cancels_queued_futures_after_workers_are_confirmed_running() -> None:
     release = threading.Event()
+    running_workers_ready = threading.Event()
+    running_workers_finished = threading.Event()
     lock = threading.Lock()
     started: list[str] = []
-    active = 0
-    peak_active = 0
+    running_workers = 0
+    finished_workers = 0
 
     def callback(api_name: str, **_) -> pd.DataFrame:
-        nonlocal active, peak_active
+        nonlocal running_workers, finished_workers
         with lock:
             started.append(api_name)
-            active += 1
-            peak_active = max(peak_active, active)
+        if api_name == "forecast":
+            return pd.DataFrame(
+                [{"end_date": "20260630", "ann_date": "20260715", "summary": "已完成"}]
+            )
+        with lock:
+            running_workers += 1
+            if running_workers == 4:
+                running_workers_ready.set()
         try:
-            if api_name == "forecast":
-                return pd.DataFrame(
-                    [{"end_date": "20260630", "ann_date": "20260715", "summary": "已完成"}]
-                )
-            release.wait(timeout=1.0)
+            release.wait()
             return pd.DataFrame()
         finally:
             with lock:
-                active -= 1
+                finished_workers += 1
+                if finished_workers == 4:
+                    running_workers_finished.set()
 
     started_at = time.monotonic()
-    result = TushareFundamentalAdapter(callback).get_fundamental_bundle(
-        "600519", timeout_seconds=0.05
-    )
-    elapsed = time.monotonic() - started_at
-    with lock:
-        started_before_release = list(started)
-    release.set()
-    time.sleep(0.05)
+    returned_without_worker_release = True
+    workers_ready = False
+    workers_finished = False
+    result = None
+    started_before_release: list[str] = []
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        future = caller.submit(
+            TushareFundamentalAdapter(callback).get_fundamental_bundle,
+            "600519",
+            0.5,
+        )
+        workers_ready = running_workers_ready.wait(timeout=1.0)
+        try:
+            try:
+                result = future.result(timeout=1.0)
+            except FutureTimeoutError:
+                returned_without_worker_release = False
+            elapsed = time.monotonic() - started_at
+            with lock:
+                started_before_release = list(started)
+        finally:
+            release.set()
+            workers_finished = running_workers_finished.wait(timeout=1.0)
+            future.result(timeout=1.0)
 
-    assert elapsed < 0.3
-    assert peak_active <= 4
+    assert workers_ready
+    assert workers_finished
+    assert returned_without_worker_release
+    assert elapsed < 0.9
+    assert running_workers == 4
     assert result["earnings"]["forecast_summary"] == "已完成"
     assert set(result["errors"]) == {
         f"{api_name}:TimeoutError"

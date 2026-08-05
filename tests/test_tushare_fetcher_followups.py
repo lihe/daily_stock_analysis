@@ -141,6 +141,31 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
             start_date="20260114",
             end_date="20260223",
         )
+
+    def test_empty_trade_calendar_is_not_cached_and_same_day_retry_can_recover(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.trade_cal.side_effect = [
+            pd.DataFrame(),
+            pd.DataFrame(
+                {
+                    "cal_date": ["20260317", "20260316"],
+                    "is_open": [1, 1],
+                }
+            ),
+        ]
+
+        with patch.object(
+            fetcher,
+            "_get_china_now",
+            return_value=datetime(2026, 3, 17, 20, 0),
+        ), patch.object(fetcher, "_check_rate_limit") as rate_limit_mock:
+            first = fetcher._get_trade_dates("20260317")
+            second = fetcher._get_trade_dates("20260317")
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, ["20260317", "20260316"])
+        self.assertEqual(fetcher._api.trade_cal.call_count, 2)
+        self.assertEqual(rate_limit_mock.call_count, 2)
         
           
     def test_get_sector_rankings_rate_limits_calendar_and_rankings_api(self) -> None:
