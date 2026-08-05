@@ -2,7 +2,7 @@
 
 ## 实施结果
 
-功能实现已于 `codex/tushare-compatible-endpoint` 完成，代码 HEAD 为
+功能实现已于 `codex/tushare-compatible-endpoint` 完成，Action 执行的 Code/Run HEAD 为
 `aa6a36c2a5cff9566df4c0dfb3d99fa570523657`。本轮保持了实时行情、结构化数据和
 降级路径的边界：
 
@@ -78,10 +78,12 @@
 
 - Run：[31049628869](https://github.com/lihe/daily_stock_analysis/actions/runs/31049628869)
 - 触发：`workflow_dispatch`，`mode=stocks-only`，`force_run=true`，`stock_codes=600797,002315`
-- Head SHA：`aa6a36c2a5cff9566df4c0dfb3d99fa570523657`
+- Action Code/Run HEAD：`aa6a36c2a5cff9566df4c0dfb3d99fa570523657`
 - 随机延迟 step：`skipped`
 - Workflow / `analyze` job：`success / success`，用时约 5 分 42 秒
 - `TUSHARE_TOKEN`：仅核验为已配置，未读取或记录值。
+
+最终 PR/remote HEAD 在 Code/Run HEAD 之上包含本轮验收文档；不将 `aa6a36c` 称为文档提交后的当前 PR HEAD。
 
 运行时来源证据和 artifact 读回见
 [`04-acceptance-report.md`](./04-acceptance-report.md)。

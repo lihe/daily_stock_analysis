@@ -426,7 +426,8 @@
         <div class="doc-meta">
           <span>STATUS · PARTIAL ACCEPTANCE</span>
           <span>DATE · 2026-08-06</span>
-          <span>HEAD · aa6a36c</span>
+          <span>CODE/RUN HEAD · aa6a36c</span>
+          <span>PR HEAD · INCLUDES ACCEPTANCE DOCS</span>
         </div>
       </header>
 
@@ -447,13 +448,13 @@
             <div class="card-icon">GATE 1 · PASS</div>
             <div class="card-name">Workflow / Job</div>
             <div class="card-where">→ success / success</div>
-            <div class="card-desc">workflow_dispatch 运行在 aa6a36c；随机延迟 step 为 skipped。</div>
+            <div class="card-desc">workflow_dispatch 运行在 Code/Run HEAD aa6a36c；随机延迟 step 为 skipped。</div>
           </div>
           <div class="card tone-b">
             <div class="card-icon">GATE 2 · PARTIAL</div>
             <div class="card-name">来源决策</div>
-            <div class="card-where">→ 路由正确，结构化超时</div>
-            <div class="card-desc">Tencent 实时、Tushare 日线/筹码均成功；基本面与资金流证据记录 timeout。</div>
+            <div class="card-where">→ 实时/日线/筹码符合预期；结构化 PARTIAL</div>
+            <div class="card-desc">Tencent 实时、Tushare 日线/筹码均成功；结构化基本面与资金流覆盖不完整，且未证明 600797 的 Tushare structured route。</div>
           </div>
           <div class="card tone-c">
             <div class="card-icon">GATE 3 · PASS/PARTIAL</div>
@@ -467,6 +468,7 @@
           实现和离线合同通过；目标 Action 与 artifact 结构通过；运行时结构化来源覆盖部分通过。
           本摘要不把 workflow 的绿色结论解释为所有数据源成功。
         </div>
+        <p><code>aa6a36c</code> 仅是本次 Action 执行的 Code/Run HEAD；最终 PR/remote HEAD 在其上包含验收文档提交。</p>
       </section>
 
       <section>

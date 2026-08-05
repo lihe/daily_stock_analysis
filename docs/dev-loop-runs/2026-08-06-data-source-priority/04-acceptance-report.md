@@ -10,7 +10,7 @@
 
 | 门禁 | 状态 | 已确认事实 |
 |---|---|---|
-| Workflow / job | **PASS** | Run `31049628869` 和 `analyze` job 均为 `success`；event 为 `workflow_dispatch`；head SHA 为 `aa6a36c`；随机延迟 step 为 `skipped` |
+| Workflow / job | **PASS** | Run `31049628869` 和 `analyze` job 均为 `success`；event 为 `workflow_dispatch`；Action Code/Run HEAD 为 `aa6a36c`；随机延迟 step 为 `skipped` |
 | 实时/结构化来源 | **PARTIAL** | 两股实时均由 Tencent 成功；日线与筹码均由 Tushare 成功；两条 `[DataSourceEvidence]` 存在，但基本面/资金流块因 timeout 降级或失败 |
 | 报告 / artifact | **PASS（结构）/ PARTIAL（数据覆盖）** | artifact 可下载且未过期；含两股报告章节和两份交易所证据 JSON；`600797` 交易所覆盖为 `PARTIAL` |
 
@@ -67,7 +67,9 @@ Artifact：[analysis-reports-93](https://github.com/lihe/daily_stock_analysis/ac
 
 - [x] Tasks 1–7 去重联合离线回归通过
 - [x] 最终 diff review 无 blocker/important finding
-- [x] 代码 HEAD 推送至现有 PR 分支
+- [x] Action 执行的 Code/Run HEAD 推送至现有 PR 分支
 - [x] 精确两股 Action 触发，随机延迟 skipped
 - [x] Workflow、来源决策、artifact 三门禁独立读回
 - [x] 脱敏文档与单文件 HTML 形成验收记录
+
+最终 PR/remote HEAD 包含 Code/Run HEAD `aa6a36c` 之后的验收文档提交；具体最终 SHA 以提交后的 Git 远程读回为准。
