@@ -17,6 +17,7 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 import json as _json
 import logging
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
@@ -33,6 +34,7 @@ from tenacity import (
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, _is_hk_market
 from .realtime_types import UnifiedRealtimeQuote, ChipDistribution
+from .tushare_fundamental_adapter import TushareFundamentalAdapter
 from src.config import DEFAULT_TUSHARE_API_URL, get_config
 import os
 from zoneinfo import ZoneInfo
@@ -152,9 +154,14 @@ class TushareFetcher(BaseFetcher):
         self.rate_limit_per_minute = rate_limit_per_minute
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
+        self._api_slots = threading.BoundedSemaphore(4)
+        self._rate_limit_lock = threading.Lock()
         self._api: Optional[object] = None  # Tushare API 实例
         self.date_list: Optional[List[str]] = None  # 交易日列表缓存（倒序，最新日期在前）
         self._date_list_end: Optional[str] = None  # 缓存对应的截止日期，用于跨日刷新
+        self._fundamental_adapter = TushareFundamentalAdapter(
+            lambda api_name, **kwargs: self._call_api_with_rate_limit(api_name, **kwargs)
+        )
 
         # 尝试初始化 API
         self._init_api()
@@ -247,47 +254,59 @@ class TushareFetcher(BaseFetcher):
         2. 如果是，重置计数器
         3. 如果当前分钟调用次数超过限制，强制休眠
         """
-        current_time = time.time()
-        
-        # 检查是否需要重置计数器（新的一分钟）
-        if self._minute_start is None:
-            self._minute_start = current_time
-            self._call_count = 0
-        elif current_time - self._minute_start >= 60:
-            # 已经过了一分钟，重置计数器
-            self._minute_start = current_time
-            self._call_count = 0
-            logger.debug("速率限制计数器已重置")
-        
-        # 检查是否超过配额
-        if self._call_count >= self.rate_limit_per_minute:
-            # 计算需要等待的时间（到下一分钟）
-            elapsed = current_time - self._minute_start
-            sleep_time = max(0, 60 - elapsed) + 1  # +1 秒缓冲
-            
-            logger.warning(
-                f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
-                f"等待 {sleep_time:.1f} 秒..."
-            )
-            
-            time.sleep(sleep_time)
-            
-            # 重置计数器
-            self._minute_start = time.time()
-            self._call_count = 0
-        
-        # 增加调用计数
-        self._call_count += 1
-        logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
+        # 计数周期的检查、重置和递增必须原子化，否则并发适配器会丢计数。
+        with self._rate_limit_lock:
+            current_time = time.time()
+
+            if self._minute_start is None:
+                self._minute_start = current_time
+                self._call_count = 0
+            elif current_time - self._minute_start >= 60:
+                self._minute_start = current_time
+                self._call_count = 0
+                logger.debug("速率限制计数器已重置")
+
+            if self._call_count >= self.rate_limit_per_minute:
+                elapsed = current_time - self._minute_start
+                sleep_time = max(0, 60 - elapsed) + 1
+                logger.warning(
+                    f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
+                    f"等待 {sleep_time:.1f} 秒..."
+                )
+                time.sleep(sleep_time)
+                self._minute_start = time.time()
+                self._call_count = 0
+
+            self._call_count += 1
+            logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
 
     def _call_api_with_rate_limit(self, method_name: str, **kwargs) -> pd.DataFrame:
         """统一通过速率限制包装 Tushare API 调用。"""
         if self._api is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
 
-        self._check_rate_limit()
-        method = getattr(self._api, method_name)
-        return method(**kwargs)
+        acquired = self._api_slots.acquire(timeout=30.0)
+        if not acquired:
+            raise RateLimitError("Tushare API 并发槽等待超时")
+        try:
+            self._check_rate_limit()
+            method = getattr(self._api, method_name)
+            return method(**kwargs)
+        finally:
+            self._api_slots.release()
+
+    def get_fundamental_bundle(self, stock_code: str, timeout_seconds: float) -> Dict[str, Any]:
+        """获取 Tushare 结构化财务数据；超时预算由调用方决定。"""
+        return self._fundamental_adapter.get_fundamental_bundle(stock_code, timeout_seconds)
+
+    def get_capital_flow(
+        self,
+        stock_code: str,
+        timeout_seconds: float,
+        top_n: int = 5,
+    ) -> Dict[str, Any]:
+        """获取 Tushare 个股与行业资金流，保留真实字段语义。"""
+        return self._fundamental_adapter.get_capital_flow(stock_code, timeout_seconds, top_n=top_n)
 
     def _get_china_now(self) -> datetime:
         """返回上海时区当前时间，方便测试覆盖跨日刷新逻辑。"""

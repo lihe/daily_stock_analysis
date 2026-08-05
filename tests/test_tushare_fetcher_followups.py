@@ -3,7 +3,10 @@
 
 import importlib.util
 import sys
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -189,3 +192,69 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertEqual(quote.code, "000001")
         self.assertEqual(quote.name, "平安银行")
         tushare_module.get_realtime_quotes.assert_called_once_with("000001")
+
+    def test_structured_capabilities_route_every_endpoint_through_fetcher_callback(self) -> None:
+        fetcher = self._make_fetcher()
+        calls = []
+
+        class FakeApi:
+            def __getattr__(self, api_name):
+                def call(**kwargs):
+                    calls.append((api_name, kwargs))
+                    return pd.DataFrame()
+
+                return call
+
+        fetcher._api = FakeApi()
+
+        fetcher.get_fundamental_bundle("600519", timeout_seconds=1.0)
+        fetcher.get_capital_flow("600519", timeout_seconds=1.0, top_n=3)
+
+        self.assertEqual(
+            {api_name for api_name, _ in calls},
+            {
+                "fina_indicator",
+                "income",
+                "cashflow",
+                "forecast",
+                "express",
+                "dividend",
+                "top10_holders",
+                "moneyflow",
+                "moneyflow_ind_ths",
+            },
+        )
+        moneyflow_kwargs = next(kwargs for api_name, kwargs in calls if api_name == "moneyflow")
+        self.assertEqual(moneyflow_kwargs["ts_code"], "600519.SH")
+
+    def test_shared_api_slots_cap_all_tushare_calls_and_counter_has_no_lost_updates(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher.rate_limit_per_minute = 100
+        active = 0
+        peak_active = 0
+        lock = threading.Lock()
+
+        class SlowApi:
+            def daily(self, **_kwargs):
+                nonlocal active, peak_active
+                with lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                try:
+                    time.sleep(0.02)
+                    return pd.DataFrame()
+                finally:
+                    with lock:
+                        active -= 1
+
+        fetcher._api = SlowApi()
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            futures = [
+                executor.submit(fetcher._call_api_with_rate_limit, "daily", ts_code=f"{index:06d}.SZ")
+                for index in range(12)
+            ]
+            for future in futures:
+                future.result(timeout=1.0)
+
+        self.assertLessEqual(peak_active, 4)
+        self.assertEqual(fetcher._call_count, 12)
