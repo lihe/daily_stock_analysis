@@ -14,6 +14,7 @@ from src.config import (
     AGENT_CONTEXT_COMPRESSION_PROFILES,
     AGENT_MAX_STEPS_DEFAULT,
     DEFAULT_ALPHASIFT_INSTALL_SPEC,
+    DEFAULT_TUSHARE_API_URL,
 )
 from src.notification_noise import NOTIFICATION_SEVERITIES
 from src.notification_routing import ROUTABLE_NOTIFICATION_CHANNELS
@@ -745,6 +746,54 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             },
         ],
         "warning_codes": ["secret_value"],
+    },
+    "TUSHARE_API_URL": {
+        "title": "Tushare API URL",
+        "description": "Tushare Pro-compatible API endpoint used by the built-in HTTP client.",
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": DEFAULT_TUSHARE_API_URL,
+        "options": [],
+        "validation": {"item_type": "url", "allowed_schemes": ["http", "https"]},
+        "display_order": 11,
+        "help_key": "settings.data_source.TUSHARE_API_URL",
+        "examples": [
+            "TUSHARE_API_URL=https://tushare-compatible.example.com",
+        ],
+        "docs": [
+            {
+                "label": "完整指南：数据源配置",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#数据源配置",
+            },
+        ],
+    },
+    "TUSHARE_BYPASS_PROXY": {
+        "title": "Tushare Bypass Proxy",
+        "description": "Ignore system proxy settings only for built-in Tushare HTTP requests.",
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 12,
+        "help_key": "settings.data_source.TUSHARE_BYPASS_PROXY",
+        "examples": [
+            "TUSHARE_BYPASS_PROXY=true",
+        ],
+        "docs": [
+            {
+                "label": "完整指南：数据源配置",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#数据源配置",
+            },
+        ],
     },
     "TICKFLOW_API_KEY": {
         "title": "TickFlow API Key",

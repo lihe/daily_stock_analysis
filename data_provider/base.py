@@ -14,8 +14,10 @@
 3. 指数退避重试机制
 """
 
+import json
 import logging
 import random
+import re
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
@@ -748,6 +750,43 @@ class DataFetcherManager:
         method = getattr(fetcher, method_name)
         with self._get_fetcher_call_lock(fetcher):
             return method(*args, **kwargs)
+
+    def _call_ordered_capability_method(
+        self,
+        fetcher: Any,
+        method_name: str,
+        absolute_deadline: float,
+        mark_attempted: Callable[[], None],
+        args: Tuple[Any, ...],
+        kwargs: Optional[Dict[str, Any]] = None,
+        timeout_parameter: Optional[str] = None,
+    ) -> Any:
+        """在 ordered capability 的绝对截止时间内等待同一实例锁并调用 provider。"""
+        remaining = max(0.0, absolute_deadline - time.monotonic())
+        if remaining <= 0:
+            raise DataFetchError(f"{method_name} capability deadline exhausted")
+
+        lock = self._get_fetcher_call_lock(fetcher)
+        acquired = False
+        try:
+            acquired = lock.acquire(timeout=remaining)
+            if not acquired:
+                raise DataFetchError(f"{method_name} capability lock timeout")
+
+            # 等锁耗时属于同一预算；只有拿锁后的正余量才能传给支持 timeout 的 provider。
+            remaining = max(0.0, absolute_deadline - time.monotonic())
+            if remaining <= 0:
+                raise DataFetchError(f"{method_name} capability deadline exhausted")
+
+            call_kwargs = dict(kwargs or {})
+            if timeout_parameter:
+                call_kwargs[timeout_parameter] = remaining
+            method = getattr(fetcher, method_name)
+            mark_attempted()
+            return method(*args, **call_kwargs)
+        finally:
+            if acquired:
+                lock.release()
 
     @classmethod
     def _filter_daily_fetchers_for_market(
@@ -2482,6 +2521,7 @@ class DataFetcherManager:
         task: Callable[[], Any],
         timeout_seconds: float,
         task_name: str,
+        absolute_deadline: Optional[float] = None,
     ) -> Tuple[Optional[Any], Optional[str], int]:
         """
         Execute a task in a short-lived thread and enforce a timeout.
@@ -2489,15 +2529,22 @@ class DataFetcherManager:
         Returns:
             (result, error, duration_ms)
         """
-        start = time.time()
+        start = time.monotonic()
         timeout_value = max(0.0, timeout_seconds)
+        if absolute_deadline is not None:
+            timeout_value = min(timeout_value, max(0.0, absolute_deadline - time.monotonic()))
         if timeout_value <= 0:
             return None, f"{task_name} timeout", 0
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
+        completion_holder: Dict[str, float] = {}
 
         if not self._fundamental_timeout_slots.acquire(blocking=False):
-            return None, f"{task_name} timeout worker pool exhausted", int(timeout_value * 1000)
+            return (
+                None,
+                f"{task_name} timeout worker pool exhausted",
+                int(max(0.0, time.monotonic() - start) * 1000),
+            )
 
         def runner() -> None:
             try:
@@ -2505,6 +2552,7 @@ class DataFetcherManager:
             except Exception as exc:
                 error_holder["value"] = exc
             finally:
+                completion_holder["at"] = time.monotonic()
                 try:
                     self._fundamental_timeout_slots.release()
                 except ValueError:
@@ -2512,25 +2560,36 @@ class DataFetcherManager:
 
         worker = Thread(target=runner, daemon=True, name=f"fundamental-{task_name}")
         try:
+            if absolute_deadline is not None and absolute_deadline - time.monotonic() <= 0:
+                self._fundamental_timeout_slots.release()
+                return None, f"{task_name} timeout", int((time.monotonic() - start) * 1000)
             worker.start()
         except Exception as exc:
             try:
                 self._fundamental_timeout_slots.release()
             except ValueError:
                 pass
-            return None, str(exc), int((time.time() - start) * 1000)
-        worker.join(timeout=timeout_value)
+            return None, str(exc), int((time.monotonic() - start) * 1000)
+        join_timeout = timeout_value
+        if absolute_deadline is not None:
+            # 线程调度耗时也属于同一绝对预算，join 不能重新获得完整 timeout。
+            join_timeout = min(join_timeout, max(0.0, absolute_deadline - time.monotonic()))
+        worker.join(timeout=join_timeout)
+        duration_ms = int(max(0.0, time.monotonic() - start) * 1000)
         if worker.is_alive():
-            return None, f"{task_name} timeout", int(timeout_value * 1000)
+            return None, f"{task_name} timeout", duration_ms
+        if absolute_deadline is not None and completion_holder.get("at", float("inf")) > absolute_deadline:
+            return None, f"{task_name} timeout", duration_ms
         if "value" in error_holder:
-            return None, str(error_holder["value"]), int((time.time() - start) * 1000)
-        return result_holder.get("value"), None, int((time.time() - start) * 1000)
+            return None, str(error_holder["value"]), duration_ms
+        return result_holder.get("value"), None, duration_ms
 
     def _run_with_retry(
         self,
         task: Callable[[], Any],
         timeout_seconds: float,
         task_name: str,
+        absolute_deadline: Optional[float] = None,
     ) -> Tuple[Optional[Any], Optional[str], int]:
         """
         Execute a task with bounded budget and best-effort retries.
@@ -2545,11 +2604,30 @@ class DataFetcherManager:
         last_error: Optional[str] = None
 
         for _ in range(attempts):
+            if absolute_deadline is not None:
+                remaining_seconds = min(
+                    remaining_seconds,
+                    max(0.0, absolute_deadline - time.monotonic()),
+                )
             if remaining_seconds <= 0:
                 break
-            result, err, cost_ms = self._run_with_timeout(task, remaining_seconds, task_name)
+            if absolute_deadline is None:
+                # 未传 deadline 的旧调用保持原三参数调用形态，兼容既有替身与扩展。
+                result, err, cost_ms = self._run_with_timeout(task, remaining_seconds, task_name)
+            else:
+                result, err, cost_ms = self._run_with_timeout(
+                    task,
+                    remaining_seconds,
+                    task_name,
+                    absolute_deadline=absolute_deadline,
+                )
             total_cost_ms += cost_ms
             remaining_seconds = max(0.0, remaining_seconds - cost_ms / 1000)
+            if absolute_deadline is not None:
+                remaining_seconds = min(
+                    remaining_seconds,
+                    max(0.0, absolute_deadline - time.monotonic()),
+                )
             if err is None:
                 return result, None, total_cost_ms
             last_error = err
@@ -2659,6 +2737,169 @@ class DataFetcherManager:
             result_ctx["status"] = "ok"
 
     @staticmethod
+    def _normalize_evidence_status(value: Any) -> str:
+        """将状态约束到稳定枚举，避免把上游自由文本带入证据日志。"""
+        normalized = str(value or "").strip().lower()
+        aliases = {
+            "success": "ok",
+            "error": "failed",
+            "unsupported": "not_supported",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized in {"ok", "partial", "failed", "not_supported", "disabled"}:
+            return normalized
+        return "unknown"
+
+    @staticmethod
+    def _sanitize_provider_endpoint(value: Any) -> Optional[str]:
+        """只保留 source_chain 中符合名称形态的来源，拒绝 URL、Token 和自由文本。"""
+        if not isinstance(value, str):
+            return None
+        name = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,96}", name):
+            return None
+        if "token" in name.lower():
+            return None
+        return name
+
+    @staticmethod
+    def _sanitize_evidence_stock_code(value: Any) -> str:
+        """证据日志仅接受规范化六位 A 股代码，其他输入统一脱敏。"""
+        if not isinstance(value, str):
+            return "redacted"
+        normalized = normalize_stock_code(value)
+        if re.fullmatch(r"\d{6}", normalized):
+            return normalized
+        return "redacted"
+
+    @staticmethod
+    def _classify_evidence_error(value: Any) -> str:
+        """把任意错误文本归一到有限安全类型，不回显完整异常消息。"""
+        try:
+            normalized = str(value or "")[:512].lower()
+        except Exception:
+            return "provider_error"
+        if "timeout" in normalized or "timed out" in normalized:
+            return "timeout"
+        if "deadline" in normalized:
+            return "deadline_exhausted"
+        if "rate limit" in normalized or "ratelimit" in normalized or "429" in normalized:
+            return "rate_limited"
+        if "permissionerror" in normalized or "permission denied" in normalized or "forbidden" in normalized:
+            return "permission_denied"
+        if "authentication" in normalized or "unauthorized" in normalized:
+            return "authentication"
+        if any(marker in normalized for marker in ("connectionerror", "connection reset", "dns", "sslerror")):
+            return "connection"
+        if any(marker in normalized for marker in ("valueerror", "typeerror", "keyerror", "jsondecodeerror")):
+            return "invalid_response"
+        if "not_supported" in normalized or "not supported" in normalized:
+            return "not_supported"
+        if "disabled" in normalized:
+            return "disabled"
+        if "partial" in normalized:
+            return "partial"
+        if "failed" in normalized or "failure" in normalized:
+            return "failed"
+        return "provider_error"
+
+    @classmethod
+    def _build_fundamental_source_evidence(
+        cls,
+        stock_code: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """从规范化 context 构建不含业务数据值的机器可解析证据。"""
+        block_names = (
+            "valuation",
+            "growth",
+            "earnings",
+            "institution",
+            "capital_flow",
+            "dragon_tiger",
+            "boards",
+        )
+        coverage_payload = context.get("coverage", {}) if isinstance(context, dict) else {}
+        if not isinstance(coverage_payload, dict):
+            coverage_payload = {}
+
+        blocks: Dict[str, Dict[str, Any]] = {}
+        coverage: Dict[str, str] = {}
+        for block_name in block_names:
+            block = context.get(block_name, {}) if isinstance(context, dict) else {}
+            if not isinstance(block, dict):
+                block = {}
+            status = cls._normalize_evidence_status(block.get("status"))
+            coverage[block_name] = cls._normalize_evidence_status(
+                coverage_payload.get(block_name, status)
+            )
+
+            provider_endpoints: List[Dict[str, str]] = []
+            seen_sources = set()
+            source_chain = block.get("source_chain", [])
+            if not isinstance(source_chain, (list, tuple)):
+                source_chain = [source_chain]
+            for source in source_chain:
+                if isinstance(source, dict):
+                    name = cls._sanitize_provider_endpoint(source.get("provider"))
+                    result = cls._normalize_evidence_status(source.get("result"))
+                else:
+                    name = cls._sanitize_provider_endpoint(source)
+                    result = "unknown"
+                if name is None or (name, result) in seen_sources:
+                    continue
+                seen_sources.add((name, result))
+                provider_endpoints.append({"name": name, "result": result})
+
+            error_values = block.get("errors", [])
+            if not isinstance(error_values, (list, tuple)):
+                error_values = [error_values]
+            error_types: List[str] = []
+            for error in error_values:
+                error_type = cls._classify_evidence_error(error)
+                if error_type not in error_types:
+                    error_types.append(error_type)
+
+            blocks[block_name] = {
+                "status": status,
+                "provider_endpoints": provider_endpoints,
+                "error_types": error_types,
+            }
+
+        return {
+            "stock_code": cls._sanitize_evidence_stock_code(stock_code),
+            "overall_status": cls._normalize_evidence_status(
+                context.get("status") if isinstance(context, dict) else None
+            ),
+            "coverage": coverage,
+            "blocks": blocks,
+        }
+
+    @classmethod
+    def _emit_fundamental_source_evidence(
+        cls,
+        stock_code: str,
+        context: Dict[str, Any],
+    ) -> None:
+        """以单行稳定 JSON 记录证据；日志失败不得改变基本面返回契约。"""
+        if not logger.isEnabledFor(logging.INFO):
+            return
+        try:
+            evidence = cls._build_fundamental_source_evidence(stock_code, context)
+        except Exception:
+            evidence = {
+                "stock_code": cls._sanitize_evidence_stock_code(stock_code),
+                "overall_status": "unknown",
+                "coverage": {},
+                "blocks": {},
+                "error_types": ["serialization_error"],
+            }
+        logger.info(
+            "[DataSourceEvidence] %s",
+            json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        )
+
+    @staticmethod
     def _has_meaningful_payload(payload: Any) -> bool:
         if payload is None:
             return False
@@ -2697,6 +2938,308 @@ class DataFetcherManager:
         if fallback_status in ("failed", "partial", "not_supported"):
             return fallback_status
         return "partial"
+
+    @staticmethod
+    def _is_fundamental_missing(value: Any) -> bool:
+        """只识别可安全降级的空值；0、False、日期和非空列表都是有效业务值。"""
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, dict):
+            return not value
+        if isinstance(value, (list, tuple, set)):
+            return not value
+        return DataFetcherManager._try_scalar_isna(value, "fundamental_merge") is True
+
+    @classmethod
+    def _contains_fundamental_missing(cls, value: Any) -> bool:
+        if isinstance(value, dict):
+            return not value or any(cls._contains_fundamental_missing(item) for item in value.values())
+        # 榜单、事件和股东明细必须整体保留；非空列表内不做跨来源逐项拼接。
+        if isinstance(value, (list, tuple, set)):
+            return not value
+        return cls._is_fundamental_missing(value)
+
+    @classmethod
+    def _fill_fundamental_missing(cls, preferred: Any, fallback: Any) -> Any:
+        """递归补空但不覆盖首选来源已经给出的有效字段。"""
+        if isinstance(preferred, dict) and isinstance(fallback, dict):
+            merged = dict(preferred)
+            for key, fallback_value in fallback.items():
+                if key in merged:
+                    merged[key] = cls._fill_fundamental_missing(merged[key], fallback_value)
+                else:
+                    merged[key] = fallback_value
+            return merged
+        if cls._is_fundamental_missing(preferred):
+            return fallback
+        return preferred
+
+    @classmethod
+    def _fundamental_bundle_needs_fallback(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        for block_name in ("growth", "earnings", "institution"):
+            block = payload.get(block_name)
+            if not isinstance(block, dict) or cls._contains_fundamental_missing(block):
+                return True
+        institution = payload.get("institution", {})
+        # Tushare 只提供真实股东快照；变动标量缺席时允许由既有 AkShare 字段补齐。
+        return (
+            "top10_holder_snapshot" in institution
+            and "top10_holder_change" not in institution
+        )
+
+    @staticmethod
+    def _capital_sector_has_rankings(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return bool(payload.get("top")) or bool(payload.get("bottom"))
+
+    @classmethod
+    def _capital_stock_needs_fallback(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict) or not payload:
+            return True
+        preferred_fields = ("net_mf_amount", "net_mf_amount_5d", "net_mf_amount_10d")
+        if any(field in payload for field in preferred_fields):
+            akshare_fields = ("main_net_inflow", "inflow_5d", "inflow_10d")
+            # 两套字段口径不同：Tushare 数值齐全也不能替代既有 AkShare 主力字段。
+            return (
+                any(cls._is_fundamental_missing(payload.get(field)) for field in preferred_fields)
+                or any(cls._is_fundamental_missing(payload.get(field)) for field in akshare_fields)
+            )
+        return cls._contains_fundamental_missing(payload)
+
+    def _find_available_tushare_fetcher(self, capability: str) -> Optional[BaseFetcher]:
+        """按稳定优先级扫描可用实例，避免同名 map 折叠覆盖前序 fetcher。"""
+        for fetcher in self._get_fetchers_snapshot():
+            if fetcher.name != "TushareFetcher":
+                continue
+            if not callable(getattr(fetcher, capability, None)):
+                continue
+            if self._call_availability_probe(fetcher, "is_available", capability) is True:
+                return fetcher
+        return None
+
+    def _collect_capability_attempt(
+        self,
+        payload: Any,
+        err: Optional[str],
+        provider: str,
+        duration_ms: int,
+        attempted: bool,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        status = str(payload.get("status", "partial")) if isinstance(payload, dict) else "failed"
+        # worker pool 拒绝调度时并未进入 provider，不能把调度失败伪装成来源尝试。
+        source_chain = [] if not attempted else self._normalize_source_chain(
+            payload.get("source_chain", []) if isinstance(payload, dict) else None,
+            provider,
+            status,
+            duration_ms,
+        )
+        errors = list(payload.get("errors", [])) if isinstance(payload, dict) else []
+        if err:
+            errors.append(err)
+        return source_chain, errors
+
+    def _run_ordered_capability_attempt(
+        self,
+        task: Callable[[Callable[[], None]], Any],
+        absolute_deadline: float,
+        task_name: str,
+        provider: str,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str], Optional[str]]:
+        """在一个绝对 deadline 内统一执行 retry、attempted 标记与元数据归一。"""
+        attempt_budget = max(0.0, absolute_deadline - time.monotonic())
+        if attempt_budget <= 0:
+            return {}, [], [], None
+
+        attempted = {"value": False}
+
+        def mark_attempted() -> None:
+            attempted["value"] = True
+
+        def run_provider() -> Any:
+            remaining = max(0.0, absolute_deadline - time.monotonic())
+            if remaining <= 0:
+                raise DataFetchError(f"{task_name} deadline exhausted")
+            return task(mark_attempted)
+
+        payload, err, cost_ms = self._run_with_retry(
+            run_provider,
+            attempt_budget,
+            task_name,
+            absolute_deadline=absolute_deadline,
+        )
+        chain, errors = self._collect_capability_attempt(
+            payload,
+            err,
+            provider,
+            cost_ms,
+            attempted["value"],
+        )
+        status = str(payload.get("status", "partial")) if isinstance(payload, dict) else "failed"
+        return payload if isinstance(payload, dict) else {}, chain, errors, status
+
+    def _get_ordered_fundamental_bundle(
+        self,
+        stock_code: str,
+        timeout_seconds: float,
+    ) -> Tuple[Dict[str, Any], int]:
+        total_budget = max(0.0, float(timeout_seconds))
+        started_at = time.monotonic()
+        # 单个能力共享一个绝对截止时间；线程调度开销也必须计入总预算。
+        total_deadline = started_at + total_budget
+        preferred_payload: Dict[str, Any] = {}
+        fallback_payload: Dict[str, Any] = {}
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        attempted_statuses: List[str] = []
+
+        tushare = self._find_available_tushare_fetcher("get_fundamental_bundle")
+        if tushare is not None and total_budget > 0:
+            preferred_budget = min(1.8, total_budget * 0.6)
+            # 首选切片锚定能力开始时刻，lookup 不能把切片向后平移。
+            preferred_deadline = min(total_deadline, started_at + preferred_budget)
+            preferred_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda mark_attempted: self._call_ordered_capability_method(
+                    tushare,
+                    "get_fundamental_bundle",
+                    preferred_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                    timeout_parameter="timeout_seconds",
+                ),
+                preferred_deadline,
+                "tushare_fundamental_bundle",
+                "tushare_fundamental_bundle",
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
+
+        needs_fallback = self._fundamental_bundle_needs_fallback(preferred_payload)
+        if needs_fallback:
+            fallback_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda mark_attempted: self._call_ordered_capability_method(
+                    self._fundamental_adapter,
+                    "get_fundamental_bundle",
+                    total_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                ),
+                total_deadline,
+                "akshare_fundamental_bundle",
+                "akshare_fundamental_bundle",
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
+            else:
+                errors.append("fundamental bundle capability deadline exhausted")
+                attempted_statuses.append("failed")
+
+        merged = self._fill_fundamental_missing(preferred_payload, fallback_payload)
+        blocks_have_content = any(
+            self._has_meaningful_payload(merged.get(name, {}))
+            for name in ("growth", "earnings", "institution")
+        )
+        if blocks_have_content:
+            status = "partial"
+        elif errors or "failed" in attempted_statuses:
+            status = "failed"
+        else:
+            status = "not_supported"
+        merged.update({"status": status, "source_chain": source_chain, "errors": errors})
+        return merged, int(max(0.0, time.monotonic() - started_at) * 1000)
+
+    def _get_ordered_capital_flow(
+        self,
+        stock_code: str,
+        timeout_seconds: float,
+    ) -> Tuple[Dict[str, Any], int]:
+        total_budget = max(0.0, float(timeout_seconds))
+        started_at = time.monotonic()
+        total_deadline = started_at + total_budget
+        preferred_payload: Dict[str, Any] = {}
+        fallback_payload: Dict[str, Any] = {}
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        attempted_statuses: List[str] = []
+
+        tushare = self._find_available_tushare_fetcher("get_capital_flow")
+        if tushare is not None and total_budget > 0:
+            preferred_budget = min(1.8, total_budget * 0.6)
+            preferred_deadline = min(total_deadline, started_at + preferred_budget)
+            preferred_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda mark_attempted: self._call_ordered_capability_method(
+                    tushare,
+                    "get_capital_flow",
+                    preferred_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                    {"top_n": 5},
+                    timeout_parameter="timeout_seconds",
+                ),
+                preferred_deadline,
+                "tushare_capital_flow",
+                "tushare_capital_flow",
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
+
+        preferred_stock = preferred_payload.get("stock_flow", {})
+        preferred_sector = preferred_payload.get("sector_rankings", {})
+        stock_needs_fallback = self._capital_stock_needs_fallback(preferred_stock)
+        sector_needs_fallback = not self._capital_sector_has_rankings(preferred_sector)
+        if stock_needs_fallback or sector_needs_fallback:
+            fallback_payload, chain, attempt_errors, attempt_status = self._run_ordered_capability_attempt(
+                lambda mark_attempted: self._call_ordered_capability_method(
+                    self._fundamental_adapter,
+                    "get_capital_flow",
+                    total_deadline,
+                    mark_attempted,
+                    (stock_code,),
+                ),
+                total_deadline,
+                "akshare_capital_flow",
+                "akshare_capital_flow",
+            )
+            source_chain.extend(chain)
+            errors.extend(attempt_errors)
+            if attempt_status is not None:
+                attempted_statuses.append(attempt_status)
+            else:
+                errors.append("capital-flow capability deadline exhausted")
+                attempted_statuses.append("failed")
+
+        fallback_stock = fallback_payload.get("stock_flow", {})
+        fallback_sector = fallback_payload.get("sector_rankings", {})
+        stock_flow = (
+            self._fill_fundamental_missing(preferred_stock, fallback_stock)
+            if stock_needs_fallback else preferred_stock
+        )
+        # 两个来源的行业榜单位不同；首选只要有非空榜单，就必须整块保留。
+        sector_rankings = fallback_sector if sector_needs_fallback else preferred_sector
+        has_content = self._has_meaningful_payload(stock_flow) or self._capital_sector_has_rankings(sector_rankings)
+        if has_content:
+            status = "partial"
+        elif errors or "failed" in attempted_statuses:
+            status = "failed"
+        else:
+            status = "not_supported"
+        return {
+            "status": status,
+            "stock_flow": stock_flow if isinstance(stock_flow, dict) else {},
+            "sector_rankings": sector_rankings if isinstance(sector_rankings, dict) else {"top": [], "bottom": []},
+            "source_chain": source_chain,
+            "errors": errors,
+        }, int(max(0.0, time.monotonic() - started_at) * 1000)
 
     @staticmethod
     def _should_cache_fundamental_context(context: Any) -> bool:
@@ -2973,7 +3516,7 @@ class DataFetcherManager:
             )
             for block in block_names
         }
-        return {
+        failed_context = {
             "market": market,
             "status": "failed",
             "coverage": {block: "failed" for block in block_names},
@@ -2981,6 +3524,9 @@ class DataFetcherManager:
             "errors": [reason],
             **blocks,
         }
+        if market == "cn" and not _is_etf_code(stock_code):
+            self._emit_fundamental_source_evidence(stock_code, failed_context)
+        return failed_context
 
     def get_fundamental_context(
         self,
@@ -2996,10 +3542,14 @@ class DataFetcherManager:
 
         config = get_config()
         if not config.enable_fundamental_pipeline:
-            return self._build_market_not_supported(
+            disabled_context = self._build_market_not_supported(
                 market=_market_tag(stock_code),
                 reason="fundamental pipeline disabled",
             )
+            normalized_code = normalize_stock_code(stock_code)
+            if _market_tag(normalized_code) == "cn" and not _is_etf_code(normalized_code):
+                self._emit_fundamental_source_evidence(normalized_code, disabled_context)
+            return disabled_context
 
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
@@ -3023,37 +3573,44 @@ class DataFetcherManager:
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
         if cache_ttl > 0:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            cache_hit = False
+            cached_context: Any = None
             with self._fundamental_cache_lock:
                 cache_item = self._fundamental_cache.get(cache_key)
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
                     if age <= cache_ttl:
                         cached_context = cache_item.get("context", {})
-                        if realtime_quote is None or is_etf or not isinstance(cached_context, dict):
-                            return cached_context
-                        valuation_payload = {
-                            "pe_ratio": getattr(realtime_quote, "pe_ratio", None),
-                            "pb_ratio": getattr(realtime_quote, "pb_ratio", None),
-                            "total_mv": getattr(realtime_quote, "total_mv", None),
-                            "circ_mv": getattr(realtime_quote, "circ_mv", None),
-                        }
-                        valuation_status = self._infer_block_status(valuation_payload, "partial")
-                        valuation = self._build_fundamental_block(
-                            valuation_status,
-                            valuation_payload,
-                            self._normalize_source_chain(
-                                [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": 0}],
-                                "realtime_quote",
-                                valuation_status,
-                                0,
-                            ),
-                        )
-                        # 只替换本轮估值且复制顶层对象，避免新行情污染跨请求复用的缓存。
-                        reused_context = dict(cached_context)
-                        reused_context["valuation"] = valuation
-                        self._refresh_fundamental_context_metadata(reused_context, is_etf=False)
-                        logger.info("[基本面] %s 缓存命中，估值复用本轮实时行情", stock_code)
-                        return reused_context
+                        cache_hit = True
+            if cache_hit:
+                if realtime_quote is None or is_etf or not isinstance(cached_context, dict):
+                    if not is_etf:
+                        self._emit_fundamental_source_evidence(stock_code, cached_context)
+                    return cached_context
+                valuation_payload = {
+                    "pe_ratio": getattr(realtime_quote, "pe_ratio", None),
+                    "pb_ratio": getattr(realtime_quote, "pb_ratio", None),
+                    "total_mv": getattr(realtime_quote, "total_mv", None),
+                    "circ_mv": getattr(realtime_quote, "circ_mv", None),
+                }
+                valuation_status = self._infer_block_status(valuation_payload, "partial")
+                valuation = self._build_fundamental_block(
+                    valuation_status,
+                    valuation_payload,
+                    self._normalize_source_chain(
+                        [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": 0}],
+                        "realtime_quote",
+                        valuation_status,
+                        0,
+                    ),
+                )
+                # 只替换本轮估值且复制顶层对象，避免新行情污染跨请求复用的缓存。
+                reused_context = dict(cached_context)
+                reused_context["valuation"] = valuation
+                self._refresh_fundamental_context_metadata(reused_context, is_etf=False)
+                logger.info("[基本面] %s 缓存命中，估值复用本轮实时行情", stock_code)
+                self._emit_fundamental_source_evidence(stock_code, reused_context)
+                return reused_context
 
         remaining_seconds = stage_timeout
         result_ctx: Dict[str, Any] = {
@@ -3116,7 +3673,7 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
+        # growth / earnings / institution share one capability deadline.
         if remaining_seconds <= 0:
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
@@ -3124,33 +3681,41 @@ class DataFetcherManager:
             bundle_ms = 0
         else:
             bundle_timeout = min(fetch_timeout, remaining_seconds)
-            bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
-                bundle_timeout,
-                "fundamental_bundle",
-            )
-            _consume_budget(bundle_ms)
-            if not isinstance(bundle_payload, dict):
-                bundle_status = "failed"
-                bundle_payload = {}
-                bundle_errors = ["fundamental_bundle failed"]
-                if bundle_err_msg:
-                    bundle_errors.append(bundle_err_msg)
+            if is_etf:
+                # ETF 维持既有 AkShare 路径，避免把股票专用 Tushare 端点引入基金路由。
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "fundamental_bundle",
+                )
+                if not isinstance(bundle_payload, dict):
+                    bundle_payload = {
+                        "status": "failed",
+                        "growth": {},
+                        "earnings": {},
+                        "institution": {},
+                        "source_chain": [],
+                        "errors": [bundle_err_msg or "fundamental_bundle failed"],
+                    }
             else:
-                bundle_status = str(bundle_payload.get("status", "not_supported"))
-                bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+                bundle_payload, bundle_ms = self._get_ordered_fundamental_bundle(
+                    stock_code,
+                    bundle_timeout,
+                )
+            _consume_budget(bundle_ms)
+            bundle_status = str(bundle_payload.get("status", "not_supported"))
+            bundle_errors = []
 
-        bundle_chain = self._normalize_source_chain(
-            bundle_payload.get("source_chain", []),
-            "fundamental_bundle",
-            bundle_status,
-            bundle_ms,
-        ) if isinstance(bundle_payload, dict) else self._normalize_source_chain(
-            None,
-            "fundamental_bundle",
-            bundle_status,
-            bundle_ms,
-        )
+        if not is_etf and isinstance(bundle_payload, dict) and "source_chain" in bundle_payload:
+            # ordered helper 已区分“已尝试”与“未调度”，这里不能再次补造默认 provider。
+            bundle_chain = list(bundle_payload.get("source_chain", []))
+        else:
+            bundle_chain = self._normalize_source_chain(
+                bundle_payload.get("source_chain", []) if isinstance(bundle_payload, dict) else None,
+                "fundamental_bundle",
+                bundle_status,
+                bundle_ms,
+            )
         growth_payload = bundle_payload.get("growth", {}) if isinstance(bundle_payload, dict) else {}
         earnings_payload = bundle_payload.get("earnings", {}) if isinstance(bundle_payload, dict) else {}
         institution_payload = bundle_payload.get("institution", {}) if isinstance(bundle_payload, dict) else {}
@@ -3284,6 +3849,8 @@ class DataFetcherManager:
                     "context": result_ctx,
                 }
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+        if not is_etf:
+            self._emit_fundamental_source_evidence(stock_code, result_ctx)
         return result_ctx
 
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
@@ -3308,18 +3875,8 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
-        payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
-            timeout,
-            "capital_flow",
-        )
-        if not isinstance(payload, dict):
-            return self._build_fundamental_block(
-                "failed",
-                {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "capital_flow failed"],
-            )
+        payload, cost_ms = self._get_ordered_capital_flow(stock_code, timeout)
+        err = None
 
         stock_flow = payload.get("stock_flow") or {}
         sector_rankings = payload.get("sector_rankings") or {}
@@ -3328,7 +3885,10 @@ class DataFetcherManager:
             has_stock_flow = any(v is not None for v in stock_flow.values())
         has_sector_rankings = bool(sector_rankings.get("top")) or bool(sector_rankings.get("bottom"))
         adapter_status = str(payload.get("status", "not_supported"))
-        if has_stock_flow or has_sector_rankings:
+        # ordered provider 全失败时必须保留 failed，不能被空 payload 映射成 partial。
+        if adapter_status == "failed":
+            capital_flow_status = "failed"
+        elif has_stock_flow or has_sector_rankings:
             capital_flow_status = "ok"
         elif adapter_status == "not_supported":
             capital_flow_status = "not_supported"
@@ -3341,12 +3901,8 @@ class DataFetcherManager:
                 "stock_flow": payload.get("stock_flow", {}),
                 "sector_rankings": payload.get("sector_rankings", {}),
             },
-            self._normalize_source_chain(
-                payload.get("source_chain", []),
-                "capital_flow",
-                capital_flow_status,
-                cost_ms,
-            ),
+            # ordered helper 的 source_chain 已包含真实 attempted 判定，空列表必须原样保留。
+            list(payload.get("source_chain", [])),
             list(payload.get("errors", [])) + ([err] if err else []),
         )
 

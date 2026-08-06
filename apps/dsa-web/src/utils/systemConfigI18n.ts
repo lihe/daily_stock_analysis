@@ -50,6 +50,8 @@ const categoryDescriptionMap: Record<UiLanguage, Partial<Record<SystemConfigCate
 const fieldTitleMap: Record<string, string> = {
   STOCK_LIST: '自选股列表',
   TUSHARE_TOKEN: 'Tushare Token',
+  TUSHARE_API_URL: 'Tushare API 地址',
+  TUSHARE_BYPASS_PROXY: 'Tushare 绕过代理',
   BOCHA_API_KEYS: 'Bocha API Keys',
   TAVILY_API_KEYS: 'Tavily API Keys',
   ANSPIRE_API_KEYS: 'Anspire API Keys',
@@ -211,6 +213,8 @@ const fieldTitleMap: Record<string, string> = {
 const fieldDescriptionMap: Record<string, string> = {
   STOCK_LIST: '使用逗号分隔股票代码，例如：600519,300750。',
   TUSHARE_TOKEN: '用于接入 Tushare Pro 数据服务的凭据。',
+  TUSHARE_API_URL: '内置 Tushare HTTP client 使用的 Pro 兼容接口地址。',
+  TUSHARE_BYPASS_PROXY: '仅控制 Tushare 专用 Session 是否忽略系统代理。',
   BOCHA_API_KEYS: '用于新闻检索的 Bocha 密钥，支持逗号分隔多个（最高优先级）。',
   TAVILY_API_KEYS: '用于新闻检索的 Tavily 密钥，支持逗号分隔多个。',
   ANSPIRE_API_KEYS: 'Anspire Open 密钥，支持逗号分隔多个；默认同时用于大模型网关和新闻检索。',

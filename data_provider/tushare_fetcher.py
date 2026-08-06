@@ -17,6 +17,7 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 import json as _json
 import logging
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
@@ -33,7 +34,8 @@ from tenacity import (
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, _is_hk_market
 from .realtime_types import UnifiedRealtimeQuote, ChipDistribution
-from src.config import get_config
+from .tushare_fundamental_adapter import TushareFundamentalAdapter
+from src.config import DEFAULT_TUSHARE_API_URL, get_config
 import os
 from zoneinfo import ZoneInfo
 
@@ -75,10 +77,22 @@ def _is_us_code(stock_code: str) -> bool:
 class _TushareHttpClient:
     """Lightweight Tushare Pro client that does not require the tushare SDK."""
 
-    def __init__(self, token: str, timeout: int = 30, api_url: str = "http://api.tushare.pro") -> None:
+    def __init__(
+        self,
+        token: str,
+        timeout: int = 30,
+        api_url: str = DEFAULT_TUSHARE_API_URL,
+        bypass_proxy: bool = False,
+    ) -> None:
         self._token = token
         self._timeout = timeout
-        self._api_url = api_url
+        self._api_url = api_url or DEFAULT_TUSHARE_API_URL
+        self._request_client = requests
+        if bypass_proxy:
+            # 只让 Tushare 请求忽略系统代理，避免影响新闻、模型和通知等其他网络链路。
+            session = requests.Session()
+            session.trust_env = False
+            self._request_client = session
 
     def query(self, api_name: str, fields: str = "", **kwargs) -> pd.DataFrame:
         req_params = {
@@ -87,7 +101,7 @@ class _TushareHttpClient:
             "params": kwargs,
             "fields": fields,
         }
-        res = requests.post(self._api_url, json=req_params, timeout=self._timeout)
+        res = self._request_client.post(self._api_url, json=req_params, timeout=self._timeout)
         if res.status_code != 200:
             raise Exception(f"Tushare API HTTP {res.status_code}")
 
@@ -140,9 +154,16 @@ class TushareFetcher(BaseFetcher):
         self.rate_limit_per_minute = rate_limit_per_minute
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
+        self._api_slots = threading.BoundedSemaphore(4)
+        self._rate_limit_lock = threading.Lock()
         self._api: Optional[object] = None  # Tushare API 实例
         self.date_list: Optional[List[str]] = None  # 交易日列表缓存（倒序，最新日期在前）
         self._date_list_end: Optional[str] = None  # 缓存对应的截止日期，用于跨日刷新
+        self._fundamental_adapter = TushareFundamentalAdapter(
+            lambda api_name, **kwargs: self._call_api_with_rate_limit(api_name, **kwargs),
+            now_provider=lambda: self._get_china_now(),
+            trade_date_resolver=self._get_trade_dates,
+        )
 
         # 尝试初始化 API
         self._init_api()
@@ -165,20 +186,34 @@ class TushareFetcher(BaseFetcher):
             return
 
         try:
-            self._api = self._build_api_client(config.tushare_token)
+            self._api = self._build_api_client(
+                config.tushare_token,
+                api_url=getattr(config, "tushare_api_url", DEFAULT_TUSHARE_API_URL),
+                bypass_proxy=bool(getattr(config, "tushare_bypass_proxy", False)),
+            )
             logger.info("Tushare API 初始化成功")
         except Exception as e:
             logger.error(f"Tushare API 初始化失败: {e}")
             self._api = None
 
-    def _build_api_client(self, token: str) -> _TushareHttpClient:
+    def _build_api_client(
+        self,
+        token: str,
+        *,
+        api_url: str = DEFAULT_TUSHARE_API_URL,
+        bypass_proxy: bool = False,
+    ) -> _TushareHttpClient:
         """
         Build a lightweight Tushare Pro client over direct HTTP requests.
 
         The project already normalizes all Pro calls through the same request
         contract, so we do not need the official tushare SDK during runtime.
         """
-        client = _TushareHttpClient(token=token)
+        client = _TushareHttpClient(
+            token=token,
+            api_url=api_url,
+            bypass_proxy=bypass_proxy,
+        )
         logger.debug("Tushare API client configured for direct HTTP calls")
         return client
 
@@ -221,47 +256,77 @@ class TushareFetcher(BaseFetcher):
         2. 如果是，重置计数器
         3. 如果当前分钟调用次数超过限制，强制休眠
         """
-        current_time = time.time()
-        
-        # 检查是否需要重置计数器（新的一分钟）
-        if self._minute_start is None:
-            self._minute_start = current_time
-            self._call_count = 0
-        elif current_time - self._minute_start >= 60:
-            # 已经过了一分钟，重置计数器
-            self._minute_start = current_time
-            self._call_count = 0
-            logger.debug("速率限制计数器已重置")
-        
-        # 检查是否超过配额
-        if self._call_count >= self.rate_limit_per_minute:
-            # 计算需要等待的时间（到下一分钟）
-            elapsed = current_time - self._minute_start
-            sleep_time = max(0, 60 - elapsed) + 1  # +1 秒缓冲
-            
+        while True:
+            # 锁内只做周期更新和名额预留，等待必须放在锁外，避免阻塞其他调用检查状态。
+            counter_reset = False
+            reserved_count: Optional[int] = None
+            with self._rate_limit_lock:
+                current_time = time.time()
+                if self._minute_start is None:
+                    self._minute_start = current_time
+                    self._call_count = 0
+                elif current_time - self._minute_start >= 60:
+                    self._minute_start = current_time
+                    self._call_count = 0
+                    counter_reset = True
+
+                if self._call_count < self.rate_limit_per_minute:
+                    self._call_count += 1
+                    reserved_count = self._call_count
+                else:
+                    elapsed = current_time - self._minute_start
+                    sleep_time = max(0, 60 - elapsed) + 1
+                    call_count = self._call_count
+
+            if counter_reset:
+                logger.debug("速率限制计数器已重置")
+            if reserved_count is not None:
+                logger.debug(
+                    f"Tushare 当前分钟调用次数: {reserved_count}/{self.rate_limit_per_minute}"
+                )
+                return
+
             logger.warning(
-                f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
+                f"Tushare 达到速率限制 ({call_count}/{self.rate_limit_per_minute} 次/分钟)，"
                 f"等待 {sleep_time:.1f} 秒..."
             )
-            
             time.sleep(sleep_time)
-            
-            # 重置计数器
-            self._minute_start = time.time()
-            self._call_count = 0
-        
-        # 增加调用计数
-        self._call_count += 1
-        logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
 
-    def _call_api_with_rate_limit(self, method_name: str, **kwargs) -> pd.DataFrame:
+    def _call_api_with_rate_limit(
+        self,
+        method_name: str,
+        *args: Any,
+        _target: Optional[object] = None,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
         """统一通过速率限制包装 Tushare API 调用。"""
-        if self._api is None:
+        target = self._api if _target is None else _target
+        if target is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
 
+        # 先拿到分钟配额，再占用网络并发槽；限流 sleep 不应耗尽四个 API slot。
         self._check_rate_limit()
-        method = getattr(self._api, method_name)
-        return method(**kwargs)
+        acquired = self._api_slots.acquire(timeout=30.0)
+        if not acquired:
+            raise RateLimitError("Tushare API 并发槽等待超时")
+        try:
+            method = getattr(target, method_name)
+            return method(*args, **kwargs)
+        finally:
+            self._api_slots.release()
+
+    def get_fundamental_bundle(self, stock_code: str, timeout_seconds: float) -> Dict[str, Any]:
+        """获取 Tushare 结构化财务数据；超时预算由调用方决定。"""
+        return self._fundamental_adapter.get_fundamental_bundle(stock_code, timeout_seconds)
+
+    def get_capital_flow(
+        self,
+        stock_code: str,
+        timeout_seconds: float,
+        top_n: int = 5,
+    ) -> Dict[str, Any]:
+        """获取 Tushare 个股与行业资金流，保留真实字段语义。"""
+        return self._fundamental_adapter.get_capital_flow(stock_code, timeout_seconds, top_n=top_n)
 
     def _get_china_now(self) -> datetime:
         """返回上海时区当前时间，方便测试覆盖跨日刷新逻辑。"""
@@ -275,10 +340,11 @@ class TushareFetcher(BaseFetcher):
         china_now = self._get_china_now()
         requested_end_date = end_date or china_now.strftime("%Y%m%d")
 
-        if self.date_list is not None and self._date_list_end == requested_end_date:
+        if self.date_list and self._date_list_end == requested_end_date:
             return self.date_list
 
-        start_date = (china_now - timedelta(days=20)).strftime("%Y%m%d")
+        # 长假前后 20 个自然日可能不足 10 个开市日，扩大窗口以满足资金流聚合。
+        start_date = (china_now - timedelta(days=40)).strftime("%Y%m%d")
         df_cal = self._call_api_with_rate_limit(
             "trade_cal",
             exchange="SSE",
@@ -286,16 +352,22 @@ class TushareFetcher(BaseFetcher):
             end_date=requested_end_date,
         )
 
-        if df_cal is None or df_cal.empty or "cal_date" not in df_cal.columns:
+        if (
+            df_cal is None
+            or df_cal.empty
+            or "cal_date" not in df_cal.columns
+            or "is_open" not in df_cal.columns
+        ):
             logger.warning("[Tushare] trade_cal 返回为空，无法更新交易日历缓存")
-            self.date_list = []
-            self._date_list_end = requested_end_date
-            return self.date_list
+            return []
 
         trade_dates = sorted(
             df_cal[df_cal["is_open"] == 1]["cal_date"].astype(str).tolist(),
             reverse=True,
         )
+        if not trade_dates:
+            logger.warning("[Tushare] trade_cal 未返回开市日，不更新交易日历缓存")
+            return []
         self.date_list = trade_dates
         self._date_list_end = requested_end_date
         return trade_dates
@@ -458,9 +530,6 @@ class TushareFetcher(BaseFetcher):
         if _is_us_code(stock_code):
             raise DataFetchError(f"TushareFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
         
-        # Rate-limit check
-        self._check_rate_limit()
-        
         is_hk = _is_hk_market(stock_code)
          # 判断是否为 ETF / 港股，以选择不同接口
         is_etf = _is_etf_code(stock_code)
@@ -482,21 +551,24 @@ class TushareFetcher(BaseFetcher):
         try:
             if is_hk:
                 # 港股使用 hk_daily 接口
-                df = self._api.hk_daily(
+                df = self._call_api_with_rate_limit(
+                    "hk_daily",
                     ts_code=ts_code,
                     start_date=ts_start,
                     end_date=ts_end,
                 )
             elif is_etf:
                 # ETF uses fund_daily interface
-                df = self._api.fund_daily(
+                df = self._call_api_with_rate_limit(
+                    "fund_daily",
                     ts_code=ts_code,
                     start_date=ts_start,
                     end_date=ts_end,
                 )
             else:
                 # Regular A-share stocks use daily interface
-                df = self._api.daily(
+                df = self._call_api_with_rate_limit(
+                    "daily",
                     ts_code=ts_code,
                     start_date=ts_start,
                     end_date=ts_end,
@@ -588,29 +660,28 @@ class TushareFetcher(BaseFetcher):
             self._stock_name_cache = {}
         
         try:
-            # 速率限制检查
-            self._check_rate_limit()
-            
-
             # 根据市场/类型选择基础信息接口
             if _is_hk_market(stock_code):
                 ts_code = self._convert_hk_stock_code_for_tushare(stock_code)
                 # 港股：使用 hk_basic
-                df = self._api.hk_basic(
+                df = self._call_api_with_rate_limit(
+                    "hk_basic",
                     ts_code=ts_code,
                     fields='ts_code,name'
                 )
             elif _is_etf_code(stock_code):
                 ts_code = self._convert_stock_code(stock_code)
                 # ETF：使用 fund_basic
-                df = self._api.fund_basic(
+                df = self._call_api_with_rate_limit(
+                    "fund_basic",
                     ts_code=ts_code,
                     fields='ts_code,name'
                 )
             else:
                 ts_code = self._convert_stock_code(stock_code)
                 # A 股股票：使用 stock_basic
-                df = self._api.stock_basic(
+                df = self._call_api_with_rate_limit(
+                    "stock_basic",
                     ts_code=ts_code,
                     fields='ts_code,name'
                 )
@@ -640,9 +711,8 @@ class TushareFetcher(BaseFetcher):
             return None
         
         try:
-            self._check_rate_limit()
-
-            df = self._api.stock_basic(
+            df = self._call_api_with_rate_limit(
+                "stock_basic",
                 exchange='',
                 list_status='L',
                 fields='ts_code,name,industry,area,market'
@@ -696,14 +766,11 @@ class TushareFetcher(BaseFetcher):
             safe_float, safe_int
         )
 
-        # 速率限制检查
-        self._check_rate_limit()
-
         # 尝试 Pro 接口
         try:
             ts_code = self._convert_stock_code(stock_code)
             # 尝试调用 Pro 实时接口 (需要积分)
-            df = self._api.quotation(ts_code=ts_code)
+            df = self._call_api_with_rate_limit("quotation", ts_code=ts_code)
 
             if df is not None and not df.empty:
                 row = df.iloc[0]
@@ -738,7 +805,11 @@ class TushareFetcher(BaseFetcher):
             symbol = self._get_legacy_realtime_symbol(stock_code)
 
             # 调用旧版实时接口 (ts.get_realtime_quotes)
-            df = ts.get_realtime_quotes(symbol)
+            df = self._call_api_with_rate_limit(
+                "get_realtime_quotes",
+                symbol,
+                _target=ts,
+            )
 
             if df is None or df.empty:
                 return None
@@ -797,8 +868,6 @@ class TushareFetcher(BaseFetcher):
         }
 
         try:
-            self._check_rate_limit()
-
             # Tushare index_daily 获取历史数据，实时数据需用其他接口或估算
             # 由于 Tushare 免费用户可能无法获取指数实时行情，这里作为备选
             # 使用 index_daily 获取最近交易日数据
@@ -811,7 +880,12 @@ class TushareFetcher(BaseFetcher):
             # 批量获取所有指数数据
             for ts_code, name in indices_map.items():
                 try:
-                    df = self._api.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+                    df = self._call_api_with_rate_limit(
+                        "index_daily",
+                        ts_code=ts_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
                     if df is not None and not df.empty:
                         row = df.iloc[0] # 最新一天
 

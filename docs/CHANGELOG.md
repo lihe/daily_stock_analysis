@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] #1772 新增台湾（台股）suffix-only 个股分析 MVP（**市场识别与数据路由层**）：手输 `.TW`（TWSE 上市）/ `.TWO`（TPEx 上柜）代码可走 YFinance 日线与近实时行情，补充市场识别、交易日历（XTAI / Asia/Taipei）、Prompt 语义与能力边界文档；加权指数 `^TWII`、柜买指数 `^TWOII`。台股股票索引/种子、Web 自动补全、API 市场枚举与 Portfolio/DecisionSignal 服务层放行作为后续 PR。
 - [文档] #1772 明确本次为台股 suffix 仅路由兼容改造，对齐 #1718 日韩模式；不涉及 provider/model/base URL/运行时配置变更；DecisionSignal 抽取对 `tw` 优雅跳过；回退方式为 revert 本次改动或移除 tw 入口恢复既有行为。
 - [改进] 每日分析手动触发跳过随机延迟，并在 A 股单次分析内复用实时行情完成基本面估值，减少重复腾讯请求；定时触发和首次失败重试保持不变。
+- [改进] 内置 Tushare HTTP client 支持可配置的 Pro 兼容接口地址，并可通过专用 Session 局部绕过系统代理；每日分析 workflow 同步映射对应 Repository Variables，官方端点与默认代理行为保持不变。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 

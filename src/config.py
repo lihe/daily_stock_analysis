@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ALPHASIFT_INSTALL_SPEC = (
     "git+https://github.com/ZhuLinsen/alphasift.git@377049857cc04175dc3cca62121ee41adec6cdb8"
 )
+DEFAULT_TUSHARE_API_URL = "http://api.tushare.pro"
 
 
 @dataclass
@@ -678,6 +679,8 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    tushare_api_url: str = DEFAULT_TUSHARE_API_URL
+    tushare_bypass_proxy: bool = False
     tickflow_api_key: Optional[str] = None
     finnhub_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
@@ -1556,6 +1559,14 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_api_url=(
+                os.getenv('TUSHARE_API_URL', DEFAULT_TUSHARE_API_URL).strip().rstrip('/')
+                or DEFAULT_TUSHARE_API_URL
+            ),
+            tushare_bypass_proxy=parse_env_bool(
+                os.getenv('TUSHARE_BYPASS_PROXY'),
+                default=False,
+            ),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             finnhub_api_key=os.getenv('FINNHUB_API_KEY') or None,
             alphavantage_api_key=os.getenv('ALPHAVANTAGE_API_KEY') or None,
@@ -2492,31 +2503,13 @@ class Config:
 
     @classmethod
     def _resolve_realtime_source_priority(cls) -> str:
-        """
-        Resolve realtime source priority with automatic tushare injection.
-
-        When TUSHARE_TOKEN is configured but REALTIME_SOURCE_PRIORITY is not
-        explicitly set, automatically prepend 'tushare' to the default priority
-        so that the paid data source is utilized for realtime quotes as well.
-        """
+        """Resolve realtime source priority without coupling it to Tushare token."""
         explicit = os.getenv('REALTIME_SOURCE_PRIORITY')
         default_priority = 'tencent,akshare_sina,efinance,akshare_em'
 
         if explicit:
             # User explicitly set priority, respect it
             return explicit
-
-        tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
-        if tushare_token:
-            # Token configured but no explicit priority override
-            # Prepend tushare so the paid source is tried first
-            import logging
-            logger = logging.getLogger(__name__)
-            resolved = f'tushare,{default_priority}'
-            logger.info(
-                f"TUSHARE_TOKEN detected, auto-injecting tushare into realtime priority: {resolved}"
-            )
-            return resolved
 
         return default_priority
 
