@@ -1,11 +1,7 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
-  schedule:
-    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
-  
-  # 手动触发
+  # 仅保留手动触发，避免自选股分析在工作日晚间自动推送。
   workflow_dispatch:
     inputs:
       mode:
@@ -45,10 +41,6 @@ jobs:
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
     
     steps:
-      - name: 随机延迟（避免固定时间访问）
-        if: github.event_name == 'schedule'
-        run: sleep $((RANDOM % 60))  # 随机延迟0-59秒启动
-      
       - name: 检出代码
         uses: actions/checkout@v5
       
